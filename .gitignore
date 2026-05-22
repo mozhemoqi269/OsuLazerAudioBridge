@@ -1,0 +1,31 @@
+# Build outputs
+bin/
+obj/
+out/
+build/
+x64/
+x86/
+.vs/
+
+# Native/CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Logs and local runtime artifacts
+*.log
+logs/
+artifacts/
+runtime/
+
+# User/local files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Packages
+packages/
+*.nupkg
+
