@@ -37,6 +37,10 @@ foreach ($file in $requiredFiles) {
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination $stagingDir
 Copy-Item -LiteralPath (Join-Path $repoRoot "THIRD_PARTY_NOTICES.md") -Destination $stagingDir
 Copy-Item -LiteralPath (Join-Path $repoRoot "README.md") -Destination (Join-Path $stagingDir "README_PROJECT.md")
+if (Test-Path (Join-Path $repoRoot "docs\images")) {
+    New-Item -ItemType Directory -Path (Join-Path $stagingDir "docs") -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repoRoot "docs\images") -Destination (Join-Path $stagingDir "docs") -Recurse -Force
+}
 
 @"
 # OsuLazerAudioBridge $Version

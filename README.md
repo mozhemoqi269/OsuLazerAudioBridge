@@ -1,5 +1,9 @@
 # OsuLazerAudioBridge
 
+<p align="center">
+  <img src="docs/images/app-screenshot.png" alt="OsuLazerAudioBridge audio output settings" width="900">
+</p>
+
 OsuLazerAudioBridge is an experimental Windows audio bridge for osu!lazer. It
 hooks the native BASS audio calls used by the official osu!lazer client and
 mirrors selected audio output to a low-latency backend such as ASIO.
