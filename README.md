@@ -181,12 +181,6 @@ Output:
 build\bin\
 ```
 
-Create a release zip:
-
-```powershell
-.\scripts\package-release.ps1
-```
-
 ## Notes
 
 This project is a local audio-output experiment. It injects a native DLL into
