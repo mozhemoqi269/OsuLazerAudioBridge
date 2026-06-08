@@ -1,5 +1,6 @@
 #include <Windows.h>
 
+#include <algorithm>
 #include <cstring>
 #include <cstdint>
 #include <mutex>
@@ -42,6 +43,10 @@ using BASS_Mixer_StreamCreate_t = HSTREAM(WINAPI*)(DWORD freq, DWORD channels, D
 using BASS_Mixer_StreamAddChannel_t = BOOL(WINAPI*)(HSTREAM handle, DWORD channel, DWORD flags);
 using BASS_Mixer_StreamRemoveChannel_t = BOOL(WINAPI*)(DWORD channel);
 using BASS_FX_TempoCreate_t = HSTREAM(WINAPI*)(DWORD channel, DWORD flags);
+using BASS_FileCloseProc_t = void(WINAPI*)(void* user);
+using BASS_FileLenProc_t = QWORD(WINAPI*)(void* user);
+using BASS_FileReadProc_t = DWORD(WINAPI*)(void* buffer, DWORD length, void* user);
+using BASS_FileSeekProc_t = BOOL(WINAPI*)(QWORD offset, void* user);
 
 constexpr DWORD BassUnicodeFlag = 0x80000000;
 constexpr DWORD BassDataFftFlag = 0x80000000;
@@ -78,6 +83,13 @@ struct BassSampleInfo {
     float outvol;
     DWORD vam;
     DWORD priority;
+};
+
+struct BassFileProcs {
+    BASS_FileCloseProc_t close;
+    BASS_FileLenProc_t length;
+    BASS_FileReadProc_t read;
+    BASS_FileSeekProc_t seek;
 };
 
 HMODULE thisModule = nullptr;
@@ -189,6 +201,51 @@ void Publish(
     const wchar_t* text = nullptr)
 {
     olab::PublishEvent(channel, sharedEvent, kind, value0, value1, value2, value3, float0, float1, text);
+}
+
+bool TryCopyFileUserStream(
+    const void* procs,
+    void* user,
+    std::uint64_t& blobOffset,
+    std::uint64_t& blobLength,
+    std::uint64_t& totalLength)
+{
+    blobOffset = 0;
+    blobLength = 0;
+    totalLength = 0;
+
+    if (procs == nullptr || user == nullptr)
+        return false;
+
+    const auto* fileProcs = static_cast<const BassFileProcs*>(procs);
+    if (fileProcs->length == nullptr || fileProcs->read == nullptr || fileProcs->seek == nullptr)
+        return false;
+
+    const QWORD length = fileProcs->length(user);
+    if (length == 0 || length > static_cast<QWORD>(olab::MaxSampleBlobBytes))
+        return false;
+
+    if (!fileProcs->seek(0, user))
+        return false;
+
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(length));
+    std::size_t copied = 0;
+    while (copied < data.size()) {
+        const DWORD request = static_cast<DWORD>(std::min<std::size_t>(data.size() - copied, 1024 * 1024));
+        const DWORD read = fileProcs->read(data.data() + copied, request, user);
+        if (read == 0)
+            break;
+        copied += read;
+    }
+
+    fileProcs->seek(0, user);
+
+    if (copied == 0)
+        return false;
+
+    data.resize(copied);
+    totalLength = length;
+    return olab::TryCopySampleBlob(channel, data.data(), static_cast<std::uint32_t>(data.size()), blobOffset, blobLength);
 }
 
 void MarkSamplePublished(HSAMPLE sample)
@@ -472,9 +529,26 @@ HSTREAM WINAPI BASS_StreamCreateFile(BOOL mem, const void* file, QWORD offset, Q
 
 HSTREAM WINAPI BASS_StreamCreateFileUser(DWORD system, DWORD flags, const void* procs, void* user)
 {
+    std::uint64_t blobOffset = 0;
+    std::uint64_t blobLength = 0;
+    std::uint64_t totalLength = 0;
+    const bool copiedUserStream = TryCopyFileUserStream(procs, user, blobOffset, blobLength, totalLength);
+
     const HSTREAM stream = originalStreamCreateFileUser(system, flags, procs, user);
-    if (stream != 0)
+    if (stream != 0) {
         Publish(olab::EventKind::StreamCreateFileUser, stream, system, flags, reinterpret_cast<std::uint64_t>(procs), 0, 0, L"BASS_StreamCreateFileUser");
+        if (copiedUserStream && blobLength != 0) {
+            Publish(
+                olab::EventKind::StreamCreateFileMemory,
+                stream,
+                blobOffset,
+                blobLength,
+                totalLength,
+                0,
+                0,
+                L"user stream memory");
+        }
+    }
 
     return stream;
 }

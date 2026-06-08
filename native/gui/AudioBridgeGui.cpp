@@ -87,6 +87,8 @@ struct ChildProcess {
     PROCESS_INFORMATION process {};
     HANDLE stdoutRead = nullptr;
     HANDLE stdoutWrite = nullptr;
+    HANDLE shutdownEvent = nullptr;
+    std::wstring shutdownEventName;
     std::thread readerThread;
     std::atomic<bool> active = false;
 
@@ -168,6 +170,7 @@ std::uint64_t g_missedCount = 0;
 std::uint64_t g_stoppedCount = 0;
 std::uint64_t g_inferredCount = 0;
 std::vector<AudioDeviceItem> g_audioDevices;
+std::wstring g_lastNumericBufferMs = L"10";
 
 constexpr COLORREF ColorCanvas = RGB(241, 243, 246);
 constexpr COLORREF ColorSurface = RGB(250, 251, 252);
@@ -456,6 +459,20 @@ std::wstring CurrentComboText(HWND combo)
     return buffer;
 }
 
+std::wstring CurrentOutputBufferArgument()
+{
+    if (CurrentOutputBackend() == L"asio")
+        return L"0";
+
+    const std::wstring selected = CurrentComboText(g_outputBufferCombo);
+    return selected == L"Driver" || selected.empty() ? L"10" : selected;
+}
+
+std::wstring CurrentOutputBufferDisplay()
+{
+    return CurrentOutputBackend() == L"asio" ? L"driver" : CurrentOutputBufferArgument();
+}
+
 int ParseVolumePercent(const std::wstring& text, int fallback)
 {
     if (text.empty())
@@ -700,8 +717,17 @@ void UpdateMusicModeHint()
     const bool mirrorMusic = SendMessageW(g_mirrorMusicCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
     const std::wstring backend = CurrentOutputBackend();
     const bool asio = backend == L"asio";
-    if (g_outputBufferCombo != nullptr)
+    if (g_outputBufferCombo != nullptr) {
+        const std::wstring selectedBuffer = CurrentComboText(g_outputBufferCombo);
+        if (!asio && !selectedBuffer.empty() && selectedBuffer != L"Driver")
+            g_lastNumericBufferMs = selectedBuffer;
+        if (asio) {
+            SelectComboText(g_outputBufferCombo, L"Driver", 0);
+        } else if (selectedBuffer == L"Driver") {
+            SelectComboText(g_outputBufferCombo, g_lastNumericBufferMs, 3);
+        }
         EnableWindow(g_outputBufferCombo, asio ? FALSE : TRUE);
+    }
     if (g_asioPanelButton != nullptr)
         EnableWindow(g_asioPanelButton, asio && !g_child.IsActive() ? TRUE : FALSE);
     HWND bufferLabel = GetDlgItem(g_window, OutputBufferComboId + 10000);
@@ -964,6 +990,13 @@ void CloseHandleIfSet(HANDLE& handle)
     }
 }
 
+std::wstring MakeShutdownEventName()
+{
+    std::wstringstream stream;
+    stream << L"Local\\OsuLazerAudioBridge.Shutdown." << GetCurrentProcessId() << L"." << GetTickCount64();
+    return stream.str();
+}
+
 void CleanupChild()
 {
     if (g_child.readerThread.joinable())
@@ -971,9 +1004,11 @@ void CleanupChild()
 
     CloseHandleIfSet(g_child.stdoutRead);
     CloseHandleIfSet(g_child.stdoutWrite);
+    CloseHandleIfSet(g_child.shutdownEvent);
     CloseHandleIfSet(g_child.process.hThread);
     CloseHandleIfSet(g_child.process.hProcess);
     g_child.process = {};
+    g_child.shutdownEventName.clear();
     g_child.active = false;
 }
 
@@ -1021,6 +1056,16 @@ bool LaunchHost(const std::wstring& arguments)
 
     SetHandleInformation(g_child.stdoutRead, HANDLE_FLAG_INHERIT, 0);
 
+    g_child.shutdownEventName = MakeShutdownEventName();
+    g_child.shutdownEvent = CreateEventW(nullptr, TRUE, FALSE, g_child.shutdownEventName.c_str());
+    if (g_child.shutdownEvent == nullptr) {
+        std::wstringstream error;
+        error << L"Failed to create shutdown event. GetLastError=" << GetLastError();
+        MessageBoxW(g_window, error.str().c_str(), L"OsuLazerAudioBridge", MB_ICONERROR);
+        CleanupChild();
+        return false;
+    }
+
     STARTUPINFOW startup {};
     startup.cb = sizeof(startup);
     startup.dwFlags = STARTF_USESTDHANDLES;
@@ -1028,7 +1073,8 @@ bool LaunchHost(const std::wstring& arguments)
     startup.hStdError = g_child.stdoutWrite;
     startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
-    std::wstring commandLine = QuoteArgument(hostPath.wstring()) + L" " + arguments;
+    std::wstring commandLine = QuoteArgument(hostPath.wstring()) + L" " + arguments
+        + L" --shutdown-event " + QuoteArgument(g_child.shutdownEventName);
     std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
     mutableCommand.push_back(L'\0');
 
@@ -1178,12 +1224,13 @@ std::wstring BuildLogArguments()
 
 std::wstring BuildOutputArguments()
 {
-    std::wstring arguments = L" --output-backend " + QuoteArgument(CurrentOutputBackend());
+    const std::wstring backend = CurrentOutputBackend();
+    std::wstring arguments = L" --output-backend " + QuoteArgument(backend);
     if (!CurrentOutputDeviceId().empty())
         arguments += L" --output-device " + QuoteArgument(CurrentOutputDeviceId());
     arguments += L" --output-sample-rate " + QuoteArgument(CurrentComboText(g_outputSampleRateCombo));
     arguments += L" --output-channels " + QuoteArgument(CurrentComboText(g_outputChannelsCombo));
-    arguments += L" --output-buffer-ms " + QuoteArgument(CurrentComboText(g_outputBufferCombo));
+    arguments += L" --output-buffer-ms " + QuoteArgument(CurrentOutputBufferArgument());
     arguments += L" --effects-volume " + QuoteArgument(SliderValueText(g_effectsVolumeSlider));
     arguments += L" --music-volume " + QuoteArgument(SliderValueText(g_musicVolumeSlider));
     return arguments;
@@ -1298,7 +1345,7 @@ void CheckSetup()
            << L" device=\"" << (deviceName.empty() ? L"(none)" : deviceName) << L"\""
            << L" rate=" << CurrentComboText(g_outputSampleRateCombo)
            << L" channels=" << CurrentComboText(g_outputChannelsCombo)
-           << L" buffer=" << (backend == L"asio" ? L"driver" : CurrentComboText(g_outputBufferCombo))
+           << L" buffer=" << CurrentOutputBufferDisplay()
            << L"\r\n";
     report << L"  Mirror: effects=" << OnOff(mirrorAudio)
            << L" music=" << OnOff(mirrorMusic)
@@ -1347,13 +1394,36 @@ void FindProcess()
     SaveSettings();
 }
 
+void RequestChildShutdown(DWORD gracefulTimeoutMs, bool forceAfterTimeout)
+{
+    if (!g_child.IsActive())
+        return;
+
+    if (g_child.shutdownEvent != nullptr)
+        SetEvent(g_child.shutdownEvent);
+
+    if (g_child.process.hProcess == nullptr)
+        return;
+
+    const DWORD waitResult = WaitForSingleObject(g_child.process.hProcess, gracefulTimeoutMs);
+    if (waitResult == WAIT_OBJECT_0)
+        return;
+
+    if (forceAfterTimeout) {
+        AppendLog(L"Graceful shutdown timed out; forcing host process to exit.\r\n");
+        TerminateProcess(g_child.process.hProcess, 1);
+        WaitForSingleObject(g_child.process.hProcess, 1500);
+    }
+}
+
 void StopBridge()
 {
     if (!g_child.IsActive())
         return;
 
-    TerminateProcess(g_child.process.hProcess, 0);
+    AppendLog(L"Requesting graceful host shutdown...\r\n");
     SetStatus(L"Stopping");
+    RequestChildShutdown(3000, true);
 }
 
 void OpenLogDirectory()
@@ -1623,11 +1693,14 @@ void CreateUi(HWND window)
     SelectComboText(g_outputSampleRateCombo, outputSampleRate, 0);
     CreateControl(L"STATIC", L"Buffer", 0, OutputBufferComboId + 10000);
     g_outputBufferCombo = CreateControl(L"COMBOBOX", L"", CBS_DROPDOWNLIST, OutputBufferComboId);
+    SendMessageW(g_outputBufferCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Driver"));
     SendMessageW(g_outputBufferCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"3"));
     SendMessageW(g_outputBufferCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"5"));
     SendMessageW(g_outputBufferCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"10"));
     SendMessageW(g_outputBufferCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"20"));
-    SelectComboText(g_outputBufferCombo, outputBufferMs, 2);
+    SelectComboText(g_outputBufferCombo, outputBufferMs, 3);
+    if (!outputBufferMs.empty() && outputBufferMs != L"Driver")
+        g_lastNumericBufferMs = outputBufferMs;
     CreateControl(L"STATIC", L"Channels", 0, OutputChannelsComboId + 10000);
     g_outputChannelsCombo = CreateControl(L"COMBOBOX", L"", CBS_DROPDOWNLIST, OutputChannelsComboId);
     SendMessageW(g_outputChannelsCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"2"));
@@ -2079,7 +2152,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_DESTROY:
         SaveSettings();
         if (g_child.IsActive())
-            TerminateProcess(g_child.process.hProcess, 0);
+            RequestChildShutdown(3000, true);
         CleanupChild();
         DeleteGdiObjectIfSet(g_font);
         DeleteGdiObjectIfSet(g_brandFont);

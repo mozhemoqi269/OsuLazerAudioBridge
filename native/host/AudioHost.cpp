@@ -48,6 +48,62 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
+std::atomic<bool> g_stopRequested = false;
+HANDLE g_consoleStopEvent = nullptr;
+
+BOOL WINAPI ConsoleControlHandler(DWORD controlType)
+{
+    switch (controlType) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        g_stopRequested.store(true);
+        if (g_consoleStopEvent != nullptr)
+            SetEvent(g_consoleStopEvent);
+        return TRUE;
+
+    default:
+        return FALSE;
+    }
+}
+
+struct UniqueHandle {
+    HANDLE handle = nullptr;
+
+    UniqueHandle() = default;
+    explicit UniqueHandle(HANDLE value)
+        : handle(value)
+    {
+    }
+
+    UniqueHandle(const UniqueHandle&) = delete;
+    UniqueHandle& operator=(const UniqueHandle&) = delete;
+
+    ~UniqueHandle()
+    {
+        Reset();
+    }
+
+    void Reset(HANDLE value = nullptr)
+    {
+        if (handle != nullptr)
+            CloseHandle(handle);
+        handle = value;
+    }
+
+    HANDLE Get() const
+    {
+        return handle;
+    }
+
+    explicit operator bool() const
+    {
+        return handle != nullptr;
+    }
+};
+
 struct SharedHandles {
     HANDLE mapping = nullptr;
     HANDLE event = nullptr;
@@ -130,6 +186,7 @@ void PrintUsage()
         << L"  --music-volume <0..200> Bridge music volume percent. Default 100.\n"
         << L"  --asio-control-panel Open the selected ASIO driver's control panel and exit.\n"
         << L"  --decode-dir <dir> Decode dumped sample .bin files and exit.\n"
+        << L"  --shutdown-event <name> Exit when this named event is signaled.\n"
         << L"  --test-tone        Play a short output-backend test tone and exit.\n";
 }
 
@@ -570,12 +627,15 @@ public:
     virtual ~IAudioOutput() = default;
     virtual bool Start(std::wstring& error) = 0;
     virtual bool Submit(std::uint64_t channel, std::vector<std::int16_t> pcm16, WORD channels, DWORD sampleRate, float volume, bool stream, std::wstring& error) = 0;
+    virtual std::shared_ptr<const std::vector<float>> PrepareFloatClip(const std::vector<float>& pcmFloat, WORD channels, DWORD sampleRate) { return nullptr; }
+    virtual bool SubmitPreparedFloat(std::uint64_t channel, std::shared_ptr<const std::vector<float>> pcmFloat, float volume, std::wstring& error) { return false; }
     virtual void ResetStream() = 0;
     virtual void ResetAll() = 0;
     virtual bool StopChannel(std::uint64_t channel) = 0;
     virtual void Stop() = 0;
     virtual void SetVolume(float volume) = 0;
     virtual const wchar_t* Name() const = 0;
+    virtual std::wstring ConsumeDiagnostics() { return {}; }
 };
 
 class WasapiExclusiveOutput final : public IAudioOutput {
@@ -677,19 +737,33 @@ public:
             return false;
 
         if (stream) {
-            std::lock_guard<std::mutex> lock(mutex);
-            EnsureStreamRing();
-            if (streamChannel != 0 && streamChannel != channel)
-                ClearStreamLocked();
-            streamChannel = channel;
+            std::lock_guard<std::mutex> submitLock(streamSubmitMutex);
+            bool resetResampler = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                EnsureStreamRingLocked();
+                if (streamChannel != 0 && streamChannel != channel) {
+                    ClearStreamRingLocked();
+                    resetResampler = true;
+                }
+                if (streamChannel != channel)
+                    resetResampler = true;
+                streamChannel = channel;
+            }
 
+            if (resetResampler)
+                ResetStreamResamplerLocked();
             std::vector<std::int16_t> converted = ConvertStreamToOutputFormatLocked(pcm16, channels, sampleRate, volume);
             if (converted.empty())
                 return false;
 
-            PushStreamSamples(converted);
-            if (streamQueuedSamples / outputChannels > MaxStreamQueuedFrames())
-                TrimStreamQueueToFrames(CorrectionStartStreamQueuedFrames());
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                const bool longStreamSubmission = converted.size() / outputChannels > LongStreamSubmissionFrames();
+                PushStreamSamples(std::move(converted), longStreamSubmission);
+                if (!streamLongForm && streamQueuedSamples / outputChannels > MaxStreamQueuedFrames())
+                    TrimStreamQueueToFrames(CorrectionStartStreamQueuedFrames());
+            }
         } else {
             std::vector<std::int16_t> converted = ConvertToOutputFormat(pcm16, channels, sampleRate, volume);
             if (converted.empty())
@@ -705,14 +779,18 @@ public:
 
     void ResetStream() override
     {
+        std::lock_guard<std::mutex> submitLock(streamSubmitMutex);
         std::lock_guard<std::mutex> lock(mutex);
-        ClearStreamLocked();
+        ClearStreamRingLocked();
+        ResetStreamResamplerLocked();
     }
 
     void ResetAll() override
     {
+        std::lock_guard<std::mutex> submitLock(streamSubmitMutex);
         std::lock_guard<std::mutex> lock(mutex);
-        ClearStreamLocked();
+        ClearStreamRingLocked();
+        ResetStreamResamplerLocked();
         activeClips.clear();
     }
 
@@ -721,10 +799,12 @@ public:
         if (channel == 0)
             return false;
 
+        std::lock_guard<std::mutex> submitLock(streamSubmitMutex);
         std::lock_guard<std::mutex> lock(mutex);
         bool stopped = false;
         if (streamChannel == channel) {
-            ClearStreamLocked();
+            ClearStreamRingLocked();
+            ResetStreamResamplerLocked();
             stopped = true;
         }
 
@@ -743,15 +823,19 @@ public:
 
     void Stop() override
     {
-        running = false;
+        running.store(false);
         if (renderEvent != nullptr)
             SetEvent(renderEvent);
 
-        if (audioClient != nullptr)
+        if (audioClient != nullptr) {
             audioClient->Stop();
+        }
 
         if (renderThread.joinable())
             renderThread.join();
+
+        if (audioClient != nullptr)
+            audioClient->Reset();
 
         if (renderEvent != nullptr) {
             CloseHandle(renderEvent);
@@ -764,8 +848,10 @@ public:
         enumerator.Reset();
 
         {
+            std::lock_guard<std::mutex> submitLock(streamSubmitMutex);
             std::lock_guard<std::mutex> lock(mutex);
-            ClearStreamLocked();
+            ClearStreamRingLocked();
+            ResetStreamResamplerLocked();
             activeClips.clear();
         }
 
@@ -785,6 +871,40 @@ public:
         return L"wasapi-exclusive";
     }
 
+    std::wstring ConsumeDiagnostics() override
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (now < nextDiagnosticsTime)
+            return {};
+
+        const std::size_t queuedFrames = outputChannels == 0 ? 0 : streamQueuedSamples / outputChannels;
+        if (queuedFrames == 0
+            && streamUnderruns == lastReportedUnderruns
+            && streamEmergencyTrims == lastReportedEmergencyTrims
+            && streamRateCorrections == lastReportedRateCorrections)
+            return {};
+
+        nextDiagnosticsTime = now + std::chrono::seconds(2);
+        lastReportedUnderruns = streamUnderruns;
+        lastReportedEmergencyTrims = streamEmergencyTrims;
+        lastReportedRateCorrections = streamRateCorrections;
+
+        std::wstringstream line;
+        line << L"WasapiDiagnostics queuedFrames=" << queuedFrames
+             << L" targetFrames=" << TargetStreamQueuedFrames()
+             << L" underruns=" << streamUnderruns
+             << L" emergencyTrims=" << streamEmergencyTrims
+             << L" concealedFrames=" << streamConcealedFrames
+             << L" rateCorrections=" << streamRateCorrections
+             << L" lastRate=" << lastStreamPlaybackRate
+             << L" longForm=" << (streamLongForm ? 1 : 0)
+             << L" outputRate=" << outputSampleRate
+             << L" bufferFrames=" << bufferFrameCount
+             << L" bufferMs=" << actualBufferMs;
+        return line.str();
+    }
+
 private:
     static constexpr WORD OutputChannels = 2;
 
@@ -797,31 +917,37 @@ private:
     std::size_t MaxStreamQueuedFrames() const
     {
         const std::size_t outputRate = outputSampleRate == 0 ? 48000 : outputSampleRate;
-        return std::max<std::size_t>(static_cast<std::size_t>(bufferFrameCount) * 20, outputRate / 5);
+        return std::max<std::size_t>(static_cast<std::size_t>(bufferFrameCount) * 3, outputRate / 40);
+    }
+
+    std::size_t LongStreamSubmissionFrames() const
+    {
+        const std::size_t outputRate = outputSampleRate == 0 ? 48000 : outputSampleRate;
+        return std::max<std::size_t>(static_cast<std::size_t>(bufferFrameCount) * 4, outputRate / 4);
     }
 
     std::size_t TargetStreamQueuedFrames() const
     {
         const std::size_t outputRate = outputSampleRate == 0 ? 48000 : outputSampleRate;
-        return std::max<std::size_t>(static_cast<std::size_t>(bufferFrameCount) * 4, outputRate / 25);
+        return std::max<std::size_t>(static_cast<std::size_t>(bufferFrameCount) * 2, outputRate / 50);
     }
 
     std::size_t CorrectionStartStreamQueuedFrames() const
     {
         const std::size_t outputRate = outputSampleRate == 0 ? 48000 : outputSampleRate;
-        return TargetStreamQueuedFrames() + std::max<std::size_t>(static_cast<std::size_t>(bufferFrameCount), outputRate / 100);
+        return TargetStreamQueuedFrames() + std::max<std::size_t>(static_cast<std::size_t>(bufferFrameCount), outputRate / 200);
     }
 
     std::size_t StreamPrebufferFrames() const
     {
         const std::size_t outputRate = outputSampleRate == 0 ? 48000 : outputSampleRate;
-        return std::max<std::size_t>(static_cast<std::size_t>(bufferFrameCount) * 3, outputRate / 40);
+        return std::max<std::size_t>(static_cast<std::size_t>(bufferFrameCount), outputRate / 100);
     }
 
     std::size_t StreamRingCapacityFrames() const
     {
         const std::size_t outputRate = outputSampleRate == 0 ? 48000 : outputSampleRate;
-        return std::max<std::size_t>(MaxStreamQueuedFrames() + static_cast<std::size_t>(bufferFrameCount) * 4, outputRate / 4);
+        return std::max<std::size_t>(MaxStreamQueuedFrames() + static_cast<std::size_t>(bufferFrameCount) * 4, outputRate / 8);
     }
 
     void TrimStreamQueueToFrames(std::size_t targetFrames)
@@ -833,14 +959,15 @@ private:
         if (queuedFrames <= targetFrames)
             return;
 
-        std::size_t samplesToDrop = (queuedFrames - targetFrames) * outputChannels;
-        DropStreamSamples(samplesToDrop);
+        std::size_t framesToDrop = queuedFrames - targetFrames;
+        DropStreamFrames(framesToDrop, true);
+        streamEmergencyTrims++;
 
         if (streamQueuedSamples == 0)
             streamPrimed = false;
     }
 
-    void EnsureStreamRing()
+    void EnsureStreamRingLocked()
     {
         const std::size_t desiredSamples = std::max<std::size_t>(
             StreamRingCapacityFrames() * outputChannels,
@@ -848,7 +975,7 @@ private:
         if (desiredSamples == 0)
             return;
 
-        if (streamRing.size() == desiredSamples)
+        if (streamRing.size() >= desiredSamples)
             return;
 
         streamRing.assign(desiredSamples, 0);
@@ -859,14 +986,17 @@ private:
         streamChannel = 0;
     }
 
-    void ClearStreamLocked()
+    void ClearStreamRingLocked()
     {
         streamReadIndex = 0;
         streamWriteIndex = 0;
         streamQueuedSamples = 0;
+        streamReadFraction = 0.0;
         streamPrimed = false;
+        streamLongForm = false;
+        lastStreamFrame.assign(outputChannels, 0);
+        hasLastStreamFrame = false;
         streamChannel = 0;
-        ResetStreamResamplerLocked();
     }
 
     void ResetStreamResamplerLocked()
@@ -878,22 +1008,41 @@ private:
         streamResampleWork.clear();
     }
 
-    void DropStreamSamples(std::size_t samplesToDrop)
+    void DropStreamFrames(std::size_t framesToDrop, bool resetFraction, bool clearPrimedWhenEmpty = true)
     {
-        if (streamRing.empty())
+        if (streamRing.empty() || outputChannels == 0)
             return;
 
+        const std::size_t samplesToDrop = framesToDrop * outputChannels;
         const std::size_t dropped = std::min(samplesToDrop, streamQueuedSamples);
         streamReadIndex = (streamReadIndex + dropped) % streamRing.size();
         streamQueuedSamples -= dropped;
-        if (streamQueuedSamples == 0)
+        if (resetFraction)
+            streamReadFraction = 0.0;
+        if (streamQueuedSamples == 0) {
             streamWriteIndex = streamReadIndex;
+            streamReadFraction = 0.0;
+            if (clearPrimedWhenEmpty)
+                streamPrimed = false;
+            streamLongForm = false;
+        }
     }
 
-    void PushStreamSamples(const std::vector<std::int16_t>& samples)
+    void PushStreamSamples(std::vector<std::int16_t>&& samples, bool longStreamSubmission)
     {
         if (samples.empty() || streamRing.empty())
             return;
+
+        if (longStreamSubmission) {
+            streamRing = std::move(samples);
+            streamReadIndex = 0;
+            streamWriteIndex = 0;
+            streamQueuedSamples = streamRing.size();
+            streamReadFraction = 0.0;
+            streamPrimed = true;
+            streamLongForm = true;
+            return;
+        }
 
         const std::size_t capacity = streamRing.size();
         if (samples.size() >= capacity) {
@@ -902,12 +1051,14 @@ private:
             streamReadIndex = 0;
             streamWriteIndex = 0;
             streamQueuedSamples = capacity;
+            streamReadFraction = 0.0;
             streamPrimed = true;
+            streamLongForm = false;
             return;
         }
 
         if (streamQueuedSamples + samples.size() > capacity)
-            DropStreamSamples(streamQueuedSamples + samples.size() - capacity);
+            TrimStreamQueueToFrames((capacity - samples.size()) / outputChannels);
 
         const std::size_t first = std::min(samples.size(), capacity - streamWriteIndex);
         std::copy(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(first), streamRing.begin() + static_cast<std::ptrdiff_t>(streamWriteIndex));
@@ -918,75 +1069,69 @@ private:
         streamQueuedSamples += samples.size();
     }
 
-    std::size_t ReadStreamSamples(std::int16_t* output, std::size_t samplesNeeded)
-    {
-        if (output == nullptr || samplesNeeded == 0 || streamRing.empty() || streamQueuedSamples == 0)
-            return 0;
-
-        const std::size_t copied = std::min(samplesNeeded, streamQueuedSamples);
-        const std::size_t first = std::min(copied, streamRing.size() - streamReadIndex);
-        std::copy(streamRing.begin() + static_cast<std::ptrdiff_t>(streamReadIndex), streamRing.begin() + static_cast<std::ptrdiff_t>(streamReadIndex + first), output);
-        if (first < copied)
-            std::copy(streamRing.begin(), streamRing.begin() + static_cast<std::ptrdiff_t>(copied - first), output + first);
-
-        streamReadIndex = (streamReadIndex + copied) % streamRing.size();
-        streamQueuedSamples -= copied;
-        if (streamQueuedSamples == 0) {
-            streamWriteIndex = streamReadIndex;
-            streamPrimed = false;
-        }
-        return copied;
-    }
-
     std::size_t RenderStreamSamples(std::int16_t* output, std::size_t outputFrames)
     {
-        if (output == nullptr || outputFrames == 0 || outputChannels == 0 || streamQueuedSamples == 0)
+        if (output == nullptr || outputFrames == 0 || outputChannels == 0)
             return 0;
 
         const std::size_t queuedFrames = streamQueuedSamples / outputChannels;
-        if (queuedFrames == 0)
-            return 0;
+        lastStreamPlaybackRate = 1.0;
+        streamReadFraction = 0.0;
+        const std::size_t renderedFrames = std::min<std::size_t>(outputFrames, queuedFrames);
 
-        const std::size_t correctionStart = CorrectionStartStreamQueuedFrames();
-        std::size_t inputFrames = std::min(outputFrames, queuedFrames);
-        if (queuedFrames > correctionStart && queuedFrames > outputFrames) {
-            const std::size_t excessFrames = queuedFrames - TargetStreamQueuedFrames();
-            const std::size_t proportionalExtra = std::max<std::size_t>(1, outputFrames / 160 + excessFrames / 160);
-            const std::size_t maxExtra = std::max<std::size_t>(1, outputFrames / 40);
-            const std::size_t extraFrames = std::min({ excessFrames, queuedFrames - outputFrames, proportionalExtra, maxExtra });
-            inputFrames = outputFrames + extraFrames;
+        if (renderedFrames != 0) {
+            const std::size_t samplesToCopy = renderedFrames * outputChannels;
+            const std::size_t first = std::min(samplesToCopy, streamRing.size() - streamReadIndex);
+            std::copy(
+                streamRing.begin() + static_cast<std::ptrdiff_t>(streamReadIndex),
+                streamRing.begin() + static_cast<std::ptrdiff_t>(streamReadIndex + first),
+                output);
+            if (first < samplesToCopy) {
+                std::copy(
+                    streamRing.begin(),
+                    streamRing.begin() + static_cast<std::ptrdiff_t>(samplesToCopy - first),
+                    output + first);
+            }
+
+            RememberLastStreamFrame(output + (renderedFrames - 1) * outputChannels);
+            DropStreamFrames(renderedFrames, false, false);
         }
 
-        const std::size_t inputSamples = inputFrames * outputChannels;
-        if (inputFrames <= outputFrames)
-            return ReadStreamSamples(output, inputSamples);
-
-        streamScratch.resize(inputSamples);
-        const std::size_t copiedSamples = ReadStreamSamples(streamScratch.data(), inputSamples);
-        const std::size_t copiedFrames = copiedSamples / outputChannels;
-        if (copiedFrames == 0)
-            return 0;
-
-        if (copiedFrames <= outputFrames) {
-            std::copy(streamScratch.begin(), streamScratch.begin() + static_cast<std::ptrdiff_t>(copiedFrames * outputChannels), output);
-            return copiedFrames * outputChannels;
+        if (renderedFrames < outputFrames) {
+            streamUnderruns++;
+            FillStreamConcealment(output + renderedFrames * outputChannels, outputFrames - renderedFrames);
         }
+        return renderedFrames * outputChannels;
+    }
 
-        const double ratio = static_cast<double>(copiedFrames) / static_cast<double>(outputFrames);
-        for (std::size_t frame = 0; frame < outputFrames; frame++) {
-            const double sourcePosition = static_cast<double>(frame) * ratio;
-            const auto index0 = static_cast<std::size_t>(std::floor(sourcePosition));
-            const std::size_t index1 = std::min(index0 + 1, copiedFrames - 1);
-            const double fraction = sourcePosition - static_cast<double>(index0);
+    void RememberLastStreamFrame(const std::int16_t* frame)
+    {
+        if (frame == nullptr || outputChannels == 0)
+            return;
+
+        if (lastStreamFrame.size() != outputChannels)
+            lastStreamFrame.assign(outputChannels, 0);
+        for (WORD channel = 0; channel < outputChannels; channel++)
+            lastStreamFrame[channel] = frame[channel];
+        hasLastStreamFrame = true;
+    }
+
+    void FillStreamConcealment(std::int16_t* output, std::size_t frames)
+    {
+        if (output == nullptr || frames == 0 || outputChannels == 0 || !hasLastStreamFrame)
+            return;
+
+        const std::size_t fadeFrames = std::min<std::size_t>(frames, std::max<std::size_t>(1, outputSampleRate / 200));
+        for (std::size_t frame = 0; frame < frames; frame++) {
+            const float gain = frame < fadeFrames
+                ? 1.0f - static_cast<float>(frame) / static_cast<float>(fadeFrames)
+                : 0.0f;
             for (WORD channel = 0; channel < outputChannels; channel++) {
-                const float a = static_cast<float>(streamScratch[index0 * outputChannels + channel]);
-                const float b = static_cast<float>(streamScratch[index1 * outputChannels + channel]);
-                const float sample = a + static_cast<float>((b - a) * fraction);
+                const float sample = static_cast<float>(lastStreamFrame[channel]) * gain;
                 output[frame * outputChannels + channel] = static_cast<std::int16_t>(std::clamp(sample, -32768.0f, 32767.0f));
             }
         }
-
-        return outputFrames * outputChannels;
+        streamConcealedFrames += frames;
     }
 
     std::vector<std::int16_t> ConvertStreamToOutputFormatLocked(
@@ -1220,7 +1365,7 @@ private:
             std::fill(output, output + samplesNeeded, 0);
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                if (streamQueuedSamples != 0) {
+                if (streamQueuedSamples != 0 || streamPrimed) {
                     const std::size_t queuedFrames = streamQueuedSamples / outputChannels;
                     if (streamPrimed || queuedFrames >= StreamPrebufferFrames()) {
                         streamPrimed = true;
@@ -1267,19 +1412,32 @@ private:
     std::atomic<bool> running = false;
     std::atomic<float> volume = 1.0f;
     std::mutex mutex;
+    std::mutex streamSubmitMutex;
     std::vector<std::int16_t> streamRing;
-    std::vector<std::int16_t> streamScratch;
     std::size_t streamReadIndex = 0;
     std::size_t streamWriteIndex = 0;
     std::size_t streamQueuedSamples = 0;
+    double streamReadFraction = 0.0;
     std::uint64_t streamChannel = 0;
     DWORD streamResampleInputSampleRate = 0;
     WORD streamResampleInputChannels = 0;
     double streamResamplePosition = 0.0;
     std::vector<std::int16_t> streamResampleCarry;
     std::vector<std::int16_t> streamResampleWork;
+    std::uint64_t streamUnderruns = 0;
+    std::uint64_t streamEmergencyTrims = 0;
+    std::uint64_t streamConcealedFrames = 0;
+    std::uint64_t streamRateCorrections = 0;
+    std::uint64_t lastReportedUnderruns = 0;
+    std::uint64_t lastReportedEmergencyTrims = 0;
+    std::uint64_t lastReportedRateCorrections = 0;
+    double lastStreamPlaybackRate = 1.0;
+    std::chrono::steady_clock::time_point nextDiagnosticsTime {};
     std::vector<Clip> activeClips;
+    std::vector<std::int16_t> lastStreamFrame;
     bool streamPrimed = false;
+    bool streamLongForm = false;
+    bool hasLastStreamFrame = false;
     bool comInitialized = false;
 };
 
@@ -1354,7 +1512,7 @@ public:
             Stop();
             return false;
         }
-        bufferFrames = preferredBuffer;
+        bufferFrames = ResolveBufferFrames(minBuffer, maxBuffer, preferredBuffer, granularity);
 
         bufferInfos.assign(outputChannels, {});
         channelInfos.assign(outputChannels, {});
@@ -1382,6 +1540,7 @@ public:
             return false;
         }
         buffersCreated = true;
+        renderScratch.assign(static_cast<std::size_t>(bufferFrames) * outputChannels, 0.0f);
 
         long inputLatency = 0;
         long outputLatency = 0;
@@ -1408,28 +1567,37 @@ public:
 
         std::lock_guard<std::mutex> lock(mutex);
         if (stream) {
-            const std::size_t MaxQueuedFrames = std::max<std::size_t>(static_cast<std::size_t>(bufferFrames) * 3, 1);
-            const std::size_t queuedFrames = streamQueuedSamples / outputChannels;
-            if (queuedFrames > MaxQueuedFrames) {
-                std::size_t samplesToDrop = (queuedFrames - MaxQueuedFrames) * outputChannels;
-                while (samplesToDrop != 0 && !streamChunks.empty()) {
-                    FloatChunk& chunk = streamChunks.front();
-                    const std::size_t remaining = chunk.samples.size() - chunk.cursor;
-                    const std::size_t dropped = std::min(samplesToDrop, remaining);
-                    chunk.cursor += dropped;
-                    samplesToDrop -= dropped;
-                    streamQueuedSamples -= dropped;
-                    if (chunk.cursor >= chunk.samples.size())
-                        streamChunks.pop_front();
-                }
-            }
-
             streamQueuedSamples += converted.size();
-            streamChunks.push_back(FloatChunk { std::move(converted), channel, 0 });
+            streamChunks.push_back(FloatChunk { std::move(converted), nullptr, channel, 0, 1.0f });
+            TrimStreamQueueToFrames(MaxStreamQueuedFrames());
+            maxObservedStreamQueuedFrames = std::max(maxObservedStreamQueuedFrames, streamQueuedSamples / outputChannels);
         } else {
-            activeClips.push_back(FloatChunk { std::move(converted), channel, 0 });
+            activeClips.push_back(FloatChunk { std::move(converted), nullptr, channel, 0, 1.0f });
         }
 
+        error.clear();
+        return true;
+    }
+
+    std::shared_ptr<const std::vector<float>> PrepareFloatClip(const std::vector<float>& pcmFloat, WORD channels, DWORD sampleRate) override
+    {
+        if (!running || pcmFloat.empty() || channels == 0 || sampleRate == 0)
+            return nullptr;
+
+        std::vector<float> converted = ConvertFloatToOutput(pcmFloat, channels, sampleRate, 1.0f);
+        if (converted.empty())
+            return nullptr;
+
+        return std::make_shared<const std::vector<float>>(std::move(converted));
+    }
+
+    bool SubmitPreparedFloat(std::uint64_t channel, std::shared_ptr<const std::vector<float>> pcmFloat, float volume, std::wstring& error) override
+    {
+        if (!running || pcmFloat == nullptr || pcmFloat->empty())
+            return false;
+
+        std::lock_guard<std::mutex> lock(mutex);
+        activeClips.push_back(FloatChunk { {}, std::move(pcmFloat), channel, 0, std::clamp(volume, 0.0f, 1.0f) });
         error.clear();
         return true;
     }
@@ -1459,7 +1627,7 @@ public:
         auto keptStream = std::deque<FloatChunk> {};
         for (FloatChunk& chunk : streamChunks) {
             if (chunk.channel == channel) {
-                streamQueuedSamples -= std::min(streamQueuedSamples, chunk.samples.size() - chunk.cursor);
+                streamQueuedSamples -= std::min(streamQueuedSamples, chunk.SampleCount() - chunk.cursor);
                 stopped = true;
             } else {
                 keptStream.push_back(std::move(chunk));
@@ -1515,16 +1683,128 @@ public:
         return L"native-asio";
     }
 
+    std::wstring ConsumeDiagnostics() override
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (now < nextDiagnosticsTime)
+            return {};
+
+        if (callbackCount == lastReportedCallbackCount
+            && underrunCallbacks == lastReportedUnderrunCallbacks
+            && droppedStreamFrames == lastReportedDroppedStreamFrames
+            && clippedSamples == lastReportedClippedSamples
+            && softLimitedSamples == lastReportedSoftLimitedSamples)
+            return {};
+
+        nextDiagnosticsTime = now + std::chrono::seconds(2);
+        lastReportedCallbackCount = callbackCount;
+        lastReportedUnderrunCallbacks = underrunCallbacks;
+        lastReportedDroppedStreamFrames = droppedStreamFrames;
+        lastReportedClippedSamples = clippedSamples;
+        lastReportedSoftLimitedSamples = softLimitedSamples;
+
+        std::wstringstream line;
+        line << L"AsioDiagnostics driver=\"" << driverName
+             << L"\" sampleRate=" << outputSampleRate
+             << L" channels=" << outputChannels
+             << L" bufferFrames=" << bufferFrames
+             << L" outputLatencyFrames=" << reportedOutputLatency
+             << L" callbacks=" << callbackCount
+             << L" streamQueuedFrames=" << (outputChannels == 0 ? 0 : streamQueuedSamples / outputChannels)
+             << L" maxStreamQueuedFrames=" << maxObservedStreamQueuedFrames
+             << L" streamUnderruns=" << underrunCallbacks
+             << L" droppedStreamFrames=" << droppedStreamFrames
+             << L" clippedSamples=" << clippedSamples
+             << L" softLimitedSamples=" << softLimitedSamples
+             << L" peak=" << std::fixed << std::setprecision(3) << maxMixedAbsSample << std::defaultfloat
+             << L" activeClips=" << activeClips.size();
+        return line.str();
+    }
+
 private:
     struct FloatChunk {
         std::vector<float> samples;
+        std::shared_ptr<const std::vector<float>> sharedSamples;
         std::uint64_t channel = 0;
         std::size_t cursor = 0;
+        float gain = 1.0f;
+
+        const std::vector<float>& Data() const
+        {
+            return sharedSamples != nullptr ? *sharedSamples : samples;
+        }
+
+        std::size_t SampleCount() const
+        {
+            return Data().size();
+        }
     };
 
     std::optional<std::wstring> ResolveDriverName() const
     {
         return ResolveAsioDriverName(config.deviceId);
+    }
+
+    long ResolveBufferFrames(long minBuffer, long maxBuffer, long preferredBuffer, long granularity) const
+    {
+        if (config.bufferMs == 0 || config.bufferMs == 10 || outputSampleRate == 0)
+            return preferredBuffer;
+
+        long requested = static_cast<long>(std::lround(
+            static_cast<double>(outputSampleRate) * static_cast<double>(config.bufferMs) / 1000.0));
+        requested = std::clamp(requested, minBuffer, maxBuffer);
+
+        if (granularity == -1) {
+            long best = minBuffer;
+            for (long value = 1; value > 0 && value <= maxBuffer; value <<= 1) {
+                if (value < minBuffer)
+                    continue;
+                if (std::llabs(static_cast<long long>(value) - requested) < std::llabs(static_cast<long long>(best) - requested))
+                    best = value;
+            }
+            return best;
+        }
+
+        if (granularity > 1) {
+            const long steps = std::max<long>(0, (requested - minBuffer + granularity / 2) / granularity);
+            requested = minBuffer + steps * granularity;
+        }
+
+        return std::clamp(requested, minBuffer, maxBuffer);
+    }
+
+    std::size_t MaxStreamQueuedFrames() const
+    {
+        if (outputSampleRate == 0)
+            return std::max<std::size_t>(static_cast<std::size_t>(bufferFrames) * 8, 1);
+
+        return std::max<std::size_t>(
+            static_cast<std::size_t>(bufferFrames) * 8,
+            static_cast<std::size_t>(outputSampleRate) / 50);
+    }
+
+    void TrimStreamQueueToFrames(std::size_t maxFrames)
+    {
+        if (outputChannels == 0)
+            return;
+
+        const std::size_t maxSamples = maxFrames * outputChannels;
+        if (streamQueuedSamples <= maxSamples)
+            return;
+
+        std::size_t samplesToDrop = streamQueuedSamples - maxSamples;
+        droppedStreamFrames += samplesToDrop / outputChannels;
+        while (samplesToDrop != 0 && !streamChunks.empty()) {
+            FloatChunk& chunk = streamChunks.front();
+            const std::size_t remaining = chunk.SampleCount() - chunk.cursor;
+            const std::size_t dropped = std::min(samplesToDrop, remaining);
+            chunk.cursor += dropped;
+            samplesToDrop -= dropped;
+            streamQueuedSamples -= dropped;
+            if (chunk.cursor >= chunk.SampleCount())
+                streamChunks.pop_front();
+        }
     }
 
     static std::string WideToAnsi(const std::wstring& value)
@@ -1571,42 +1851,93 @@ private:
         return output;
     }
 
+    std::vector<float> ConvertFloatToOutput(const std::vector<float>& input, WORD inputChannels, DWORD inputSampleRate, float inputVolume) const
+    {
+        const std::size_t inputFrames = input.size() / inputChannels;
+        if (inputFrames == 0)
+            return {};
+
+        const double ratio = static_cast<double>(inputSampleRate) / static_cast<double>(outputSampleRate);
+        const std::size_t outputFrames = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(static_cast<double>(inputFrames) / ratio)));
+        std::vector<float> output(outputFrames * outputChannels);
+        const float gain = std::clamp(inputVolume, 0.0f, 1.0f);
+
+        for (std::size_t frame = 0; frame < outputFrames; frame++) {
+            const double sourcePosition = static_cast<double>(frame) * ratio;
+            const auto index0 = static_cast<std::size_t>(std::floor(sourcePosition));
+            const std::size_t index1 = std::min(index0 + 1, inputFrames - 1);
+            const double fraction = sourcePosition - static_cast<double>(index0);
+
+            for (WORD channel = 0; channel < outputChannels; channel++) {
+                const WORD inputChannel = inputChannels == 1
+                    ? 0
+                    : std::min<WORD>(channel, inputChannels - 1);
+                const float a = std::clamp(input[index0 * inputChannels + inputChannel], -1.0f, 1.0f);
+                const float b = std::clamp(input[index1 * inputChannels + inputChannel], -1.0f, 1.0f);
+                output[frame * outputChannels + channel] = std::clamp((a + static_cast<float>((b - a) * fraction)) * gain, -1.0f, 1.0f);
+            }
+        }
+
+        return output;
+    }
+
     void Render(long doubleBufferIndex)
     {
         if (doubleBufferIndex < 0 || doubleBufferIndex > 1)
             return;
 
-        std::vector<float> interleaved(static_cast<std::size_t>(bufferFrames) * outputChannels);
+        if (renderScratch.size() != static_cast<std::size_t>(bufferFrames) * outputChannels)
+            return;
+
+        std::fill(renderScratch.begin(), renderScratch.end(), 0.0f);
         {
             std::lock_guard<std::mutex> lock(mutex);
+            callbackCount++;
+            const bool streamWasQueued = streamQueuedSamples != 0;
             std::size_t cursor = 0;
-            while (cursor < interleaved.size() && !streamChunks.empty()) {
+            while (cursor < renderScratch.size() && !streamChunks.empty()) {
                 FloatChunk& chunk = streamChunks.front();
-                const std::size_t remaining = chunk.samples.size() - chunk.cursor;
-                const std::size_t copied = std::min(interleaved.size() - cursor, remaining);
+                const std::vector<float>& samples = chunk.Data();
+                const std::size_t remaining = samples.size() - chunk.cursor;
+                const std::size_t copied = std::min(renderScratch.size() - cursor, remaining);
                 std::copy(
-                    chunk.samples.begin() + static_cast<std::ptrdiff_t>(chunk.cursor),
-                    chunk.samples.begin() + static_cast<std::ptrdiff_t>(chunk.cursor + copied),
-                    interleaved.begin() + static_cast<std::ptrdiff_t>(cursor));
+                    samples.begin() + static_cast<std::ptrdiff_t>(chunk.cursor),
+                    samples.begin() + static_cast<std::ptrdiff_t>(chunk.cursor + copied),
+                    renderScratch.begin() + static_cast<std::ptrdiff_t>(cursor));
                 chunk.cursor += copied;
                 cursor += copied;
                 streamQueuedSamples -= std::min(streamQueuedSamples, copied);
-                if (chunk.cursor >= chunk.samples.size())
+                if (chunk.cursor >= samples.size())
                     streamChunks.pop_front();
             }
+            if (streamWasQueued && cursor < renderScratch.size())
+                underrunCallbacks++;
 
             auto write = activeClips.begin();
             for (auto read = activeClips.begin(); read != activeClips.end(); ++read) {
-                const std::size_t remaining = read->samples.size() - read->cursor;
-                const std::size_t mixed = std::min(interleaved.size(), remaining);
-                for (std::size_t i = 0; i < mixed; i++)
-                    interleaved[i] = std::clamp(interleaved[i] + read->samples[read->cursor + i], -1.0f, 1.0f);
+                const std::vector<float>& samples = read->Data();
+                const std::size_t remaining = samples.size() - read->cursor;
+                const std::size_t mixed = std::min(renderScratch.size(), remaining);
+                for (std::size_t i = 0; i < mixed; i++) {
+                    renderScratch[i] += samples[read->cursor + i] * read->gain;
+                }
 
                 read->cursor += mixed;
-                if (read->cursor < read->samples.size())
+                if (read->cursor < samples.size())
                     *write++ = std::move(*read);
             }
             activeClips.erase(write, activeClips.end());
+
+            for (float& sample : renderScratch) {
+                const float absolute = std::fabs(sample);
+                maxMixedAbsSample = std::max(maxMixedAbsSample, absolute);
+                if (absolute > 1.0f)
+                    clippedSamples++;
+                if (absolute > SoftLimitThreshold) {
+                    sample = SoftLimit(sample);
+                    softLimitedSamples++;
+                }
+            }
         }
 
         for (WORD channel = 0; channel < outputChannels; channel++) {
@@ -1614,7 +1945,7 @@ private:
             if (buffer == nullptr)
                 continue;
 
-            WriteChannelBuffer(buffer, channelInfos[channel].type, interleaved, channel);
+            WriteChannelBuffer(buffer, channelInfos[channel].type, renderScratch, channel);
         }
 
         if (theAsioDriver != nullptr && theAsioDriver->outputReady() == ASE_OK) {
@@ -1744,6 +2075,19 @@ private:
         return static_cast<std::int32_t>(sample >= 0.0f ? sample * positive : sample * negative);
     }
 
+    static float SoftLimit(float sample)
+    {
+        const float absolute = std::fabs(sample);
+        if (absolute <= SoftLimitThreshold)
+            return sample;
+
+        const float sign = sample < 0.0f ? -1.0f : 1.0f;
+        const float range = 1.0f - SoftLimitThreshold;
+        const float excess = absolute - SoftLimitThreshold;
+        const float limited = SoftLimitThreshold + range * (1.0f - std::exp(-excess / range));
+        return sign * std::min(limited, 1.0f);
+    }
+
     static void WriteBigEndian(std::uint8_t* output, std::uint64_t value, int bytes)
     {
         for (int i = 0; i < bytes; i++)
@@ -1803,6 +2147,7 @@ private:
     std::vector<ASIOChannelInfo> channelInfos;
     std::wstring driverName;
     std::string driverNameUtf8;
+    std::vector<float> renderScratch;
     WORD outputChannels = 2;
     DWORD outputSampleRate = 48000;
     long bufferFrames = 0;
@@ -1814,6 +2159,20 @@ private:
     std::deque<FloatChunk> streamChunks;
     std::vector<FloatChunk> activeClips;
     std::size_t streamQueuedSamples = 0;
+    std::size_t maxObservedStreamQueuedFrames = 0;
+    std::uint64_t callbackCount = 0;
+    std::uint64_t underrunCallbacks = 0;
+    std::uint64_t droppedStreamFrames = 0;
+    std::uint64_t clippedSamples = 0;
+    std::uint64_t softLimitedSamples = 0;
+    std::uint64_t lastReportedCallbackCount = 0;
+    std::uint64_t lastReportedUnderrunCallbacks = 0;
+    std::uint64_t lastReportedDroppedStreamFrames = 0;
+    std::uint64_t lastReportedClippedSamples = 0;
+    std::uint64_t lastReportedSoftLimitedSamples = 0;
+    float maxMixedAbsSample = 0.0f;
+    static constexpr float SoftLimitThreshold = 0.92f;
+    std::chrono::steady_clock::time_point nextDiagnosticsTime {};
     static inline NativeAsioOutput* currentInstance = nullptr;
 };
 
@@ -1922,6 +2281,13 @@ public:
         if (!active || data == nullptr || length == 0)
             return false;
 
+        decodedSamples.erase(sample);
+        preparedOutputSamples.erase(sample);
+        if (length > MaxMirroredEffectContainerBytes) {
+            LogSkippedEffectSample(sample, length, L"container-too-large", log);
+            return false;
+        }
+
         olab::DecodedSample decoded;
         std::string error;
         if (!olab::DecodeSampleMemory(data, length, decoded, error)) {
@@ -1933,7 +2299,9 @@ public:
             return false;
         }
 
+        TrimDecodedEffectSample(sample, decoded, log);
         decodedSamples[sample] = std::move(decoded);
+        PrepareOutputSample(sample);
         const olab::DecodedSample& stored = decodedSamples[sample];
         std::wstringstream line;
         line << L"MirrorDecodedSample sample=0x" << std::hex << sample << std::dec
@@ -1957,20 +2325,37 @@ public:
         if (!active || data == nullptr || byteLength == 0 || sampleRate == 0 || channels == 0)
             return false;
 
-        const std::size_t samples = static_cast<std::size_t>(byteLength / sizeof(std::int16_t));
-        if (samples == 0)
+        decodedSamples.erase(sample);
+        preparedOutputSamples.erase(sample);
+        if (byteLength > MaxMirroredEffectPcmBytes) {
+            LogSkippedEffectSample(sample, byteLength, L"pcm-too-large", log);
+            return false;
+        }
+
+        const std::size_t sourceSamples = static_cast<std::size_t>(byteLength / sizeof(std::int16_t));
+        const std::size_t sourceFrames = sourceSamples / static_cast<std::size_t>(channels);
+        if (sourceFrames == 0)
             return false;
 
         const auto* source = reinterpret_cast<const std::int16_t*>(data);
+        const std::size_t keptFrames = std::min<std::size_t>(
+            sourceFrames,
+            MaxMirroredEffectFrameCount(sampleRate));
+        const std::size_t keptSamples = keptFrames * static_cast<std::size_t>(channels);
         olab::DecodedSample decoded;
         decoded.sampleRate = sampleRate;
         decoded.channels = channels;
         decoded.format = "pcm16";
-        decoded.frames.resize(samples);
-        for (std::size_t i = 0; i < samples; i++)
+        decoded.frames.resize(keptSamples);
+        for (std::size_t i = 0; i < keptSamples; i++)
             decoded.frames[i] = source[i] / 32768.0f;
 
+        if (keptFrames < sourceFrames) {
+            FadeDecodedEffectTail(decoded);
+            LogTrimmedEffectSample(sample, sourceSamples, keptSamples, log);
+        }
         decodedSamples[sample] = std::move(decoded);
+        PrepareOutputSample(sample);
         const olab::DecodedSample& stored = decodedSamples[sample];
         std::wstringstream line;
         line << L"MirrorDecodedPcmSample sample=0x" << std::hex << sample << std::dec
@@ -1982,7 +2367,7 @@ public:
         return true;
     }
 
-    bool PlaySample(std::uint64_t sample, std::uint64_t channel, float volume, ProbeLog& log)
+    bool PlaySample(std::uint64_t sample, std::uint64_t channel, float volume, double eventAgeUs, ProbeLog& log)
     {
         if (!active)
             return false;
@@ -1995,6 +2380,26 @@ public:
         if (decoded.frames.empty() || decoded.channels == 0 || decoded.sampleRate == 0)
             return false;
 
+        std::wstringstream line;
+        line << L"MirrorPlayedSample sample=0x" << std::hex << sample << std::dec
+             << L" channel=0x" << std::hex << channel << std::dec
+             << L" sampleRate=" << decoded.sampleRate
+             << L" channels=" << decoded.channels
+             << L" pcmSamples=" << decoded.frames.size()
+             << L" volume=" << volume;
+        if (eventAgeUs >= 0.0)
+            line << L" eventAgeUs=" << std::fixed << std::setprecision(1) << eventAgeUs << std::defaultfloat;
+
+        if (output != nullptr) {
+            auto prepared = preparedOutputSamples.find(sample);
+            if (prepared == preparedOutputSamples.end()) {
+                PrepareOutputSample(sample);
+                prepared = preparedOutputSamples.find(sample);
+            }
+            if (prepared != preparedOutputSamples.end())
+                return SubmitPreparedOutputPcm(channel, prepared->second, volume, line.str(), log);
+        }
+
         std::vector<std::int16_t> pcm16(decoded.frames.size());
         for (std::size_t i = 0; i < decoded.frames.size(); i++) {
             float clamped = std::clamp(decoded.frames[i], -1.0f, 1.0f);
@@ -2003,13 +2408,6 @@ public:
                 : clamped * 32768.0f);
         }
 
-        std::wstringstream line;
-        line << L"MirrorPlayedSample sample=0x" << std::hex << sample << std::dec
-             << L" channel=0x" << std::hex << channel << std::dec
-             << L" sampleRate=" << decoded.sampleRate
-             << L" channels=" << decoded.channels
-             << L" pcmSamples=" << decoded.frames.size()
-             << L" volume=" << volume;
         return PlayPcm16(std::move(pcm16), static_cast<WORD>(decoded.channels), decoded.sampleRate, channel, volume, line.str(), log);
     }
 
@@ -2326,6 +2724,11 @@ public:
     }
 
 private:
+    static constexpr std::uint64_t MaxMirroredEffectContainerBytes = 512ull * 1024ull;
+    static constexpr std::uint64_t MaxMirroredEffectPcmBytes = 2ull * 1024ull * 1024ull;
+    static constexpr double MaxMirroredEffectSeconds = 0.75;
+    static constexpr std::size_t EffectTrimFadeFrames = 240;
+
     struct VoiceBuffer {
         IXAudio2SourceVoice* voice = nullptr;
         std::uint64_t channel = 0;
@@ -2360,6 +2763,125 @@ private:
         std::wstringstream line;
         line << L"AudioMirrorError operation=\"" << operation << L"\" hr=0x" << std::hex << static_cast<unsigned long>(hr);
         return line.str();
+    }
+
+    static void LogSkippedEffectSample(std::uint64_t sample, std::uint64_t bytes, const wchar_t* reason, ProbeLog& log)
+    {
+        std::wstringstream line;
+        line << L"MirrorSkippedSample sample=0x" << std::hex << sample << std::dec
+             << L" bytes=" << bytes
+             << L" reason=\"" << reason << L"\"";
+        PrintAndLogLine(line.str(), log);
+    }
+
+    static std::size_t MaxMirroredEffectFrameCount(std::uint32_t sampleRate)
+    {
+        return std::max<std::size_t>(
+            1,
+            static_cast<std::size_t>(std::lround(static_cast<double>(sampleRate) * MaxMirroredEffectSeconds)));
+    }
+
+    static void LogTrimmedEffectSample(std::uint64_t sample, std::size_t originalSamples, std::size_t keptSamples, ProbeLog& log)
+    {
+        std::wstringstream line;
+        line << L"MirrorTrimmedSample sample=0x" << std::hex << sample << std::dec
+             << L" originalSamples=" << originalSamples
+             << L" keptSamples=" << keptSamples
+             << L" maxMs=" << static_cast<int>(std::lround(MaxMirroredEffectSeconds * 1000.0));
+        PrintAndLogLine(line.str(), log);
+    }
+
+    static void FadeDecodedEffectTail(olab::DecodedSample& decoded)
+    {
+        if (decoded.frames.empty() || decoded.channels == 0 || decoded.sampleRate == 0)
+            return;
+
+        const std::size_t channels = static_cast<std::size_t>(decoded.channels);
+        const std::size_t frameCount = decoded.frames.size() / channels;
+        if (frameCount == 0)
+            return;
+
+        const std::size_t fadeFrames = std::min<std::size_t>(EffectTrimFadeFrames, frameCount);
+        const std::size_t fadeStartFrame = frameCount - fadeFrames;
+
+        for (std::size_t frame = fadeStartFrame; frame < frameCount; frame++) {
+            const float gain = static_cast<float>(frameCount - frame) / static_cast<float>(fadeFrames + 1);
+            for (std::size_t channel = 0; channel < channels; channel++)
+                decoded.frames[frame * channels + channel] *= gain;
+        }
+    }
+
+    static void TrimDecodedEffectSample(std::uint64_t sample, olab::DecodedSample& decoded, ProbeLog& log)
+    {
+        if (decoded.frames.empty() || decoded.channels == 0 || decoded.sampleRate == 0)
+            return;
+
+        const std::size_t channels = static_cast<std::size_t>(decoded.channels);
+        const std::size_t frameCount = decoded.frames.size() / channels;
+        const std::size_t maxFrames = MaxMirroredEffectFrameCount(decoded.sampleRate);
+        if (frameCount <= maxFrames)
+            return;
+
+        const std::size_t originalSamples = decoded.frames.size();
+        const std::size_t keptSamples = maxFrames * channels;
+        decoded.frames.resize(keptSamples);
+        FadeDecodedEffectTail(decoded);
+        LogTrimmedEffectSample(sample, originalSamples, keptSamples, log);
+    }
+
+    void PrepareOutputSample(std::uint64_t sample)
+    {
+        preparedOutputSamples.erase(sample);
+        if (output == nullptr)
+            return;
+
+        const auto found = decodedSamples.find(sample);
+        if (found == decodedSamples.end())
+            return;
+
+        const olab::DecodedSample& decoded = found->second;
+        if (decoded.frames.empty() || decoded.channels == 0 || decoded.sampleRate == 0)
+            return;
+
+        auto prepared = output->PrepareFloatClip(
+            decoded.frames,
+            static_cast<WORD>(decoded.channels),
+            decoded.sampleRate);
+        if (prepared != nullptr)
+            preparedOutputSamples[sample] = std::move(prepared);
+    }
+
+    bool SubmitPreparedOutputPcm(
+        std::uint64_t channel,
+        std::shared_ptr<const std::vector<float>> pcmFloat,
+        float volume,
+        const std::wstring& successLine,
+        ProbeLog& log)
+    {
+        if (output == nullptr || pcmFloat == nullptr || pcmFloat->empty())
+            return false;
+
+        std::wstring error;
+        if (!output->SubmitPreparedFloat(channel, std::move(pcmFloat), volume, error)) {
+            if (!error.empty())
+                PrintAndLogLine(error, log);
+            return false;
+        }
+
+        outputSubmitted++;
+        if (outputSubmitted <= 3 || outputSubmitted % 100 == 0) {
+            std::wstringstream line;
+            line << successLine
+                 << L" backend=\"" << output->Name()
+                 << L"\" prepared=1 submitted=" << outputSubmitted;
+            PrintAndLogLine(line.str(), log);
+        }
+        if (log.IsEnabled()) {
+            const std::wstring diagnostics = output->ConsumeDiagnostics();
+            if (!diagnostics.empty())
+                log.WriteLine(diagnostics);
+        }
+        return true;
     }
 
     bool PlayPcm16(
@@ -2519,6 +3041,11 @@ private:
                  << L"\" submitted=" << outputSubmitted;
             PrintAndLogLine(line.str(), log);
         }
+        if (log.IsEnabled()) {
+            const std::wstring diagnostics = output->ConsumeDiagnostics();
+            if (!diagnostics.empty())
+                log.WriteLine(diagnostics);
+        }
         return true;
     }
 
@@ -2660,6 +3187,7 @@ private:
     std::vector<VoiceBuffer*> activeVoices;
     std::unordered_map<std::uint64_t, PcmStreamVoice*> pcmStreams;
     std::unordered_map<std::uint64_t, olab::DecodedSample> decodedSamples;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const std::vector<float>>> preparedOutputSamples;
     std::unordered_map<std::uint64_t, olab::DecodedSample> musicStreams;
     bool comInitialized = false;
     bool active = false;
@@ -2695,16 +3223,38 @@ struct ProbeState {
     std::uint64_t musicDecodedCount = 0;
     std::uint64_t musicPlayedCount = 0;
     std::uint64_t musicMissedCount = 0;
+    std::uint64_t playbackEventAgeCount = 0;
+    double playbackEventAgeTotalUs = 0.0;
+    double playbackEventAgeMaxUs = 0.0;
+    std::uint64_t lastPrintedMirrorDecodedCount = 0;
     std::uint64_t lastPrintedMirrorPlayedCount = 0;
     std::uint64_t lastPrintedMirrorMissedCount = 0;
+    std::uint64_t lastPrintedMirrorStoppedCount = 0;
+    std::uint64_t lastPrintedMusicDecodedCount = 0;
     std::uint64_t lastPrintedMusicPlayedCount = 0;
     std::uint64_t lastPrintedMusicMissedCount = 0;
     AudioMirror* audioMirror = nullptr;
 };
 
-void PrintMirrorStats(const ProbeState& state, ProbeLog& log)
+void PrintMirrorStats(ProbeState& state, ProbeLog& log)
 {
     if (state.audioMirror == nullptr)
+        return;
+
+    const bool shouldPrint =
+        (state.mirrorDecodedCount != state.lastPrintedMirrorDecodedCount
+            && (state.mirrorDecodedCount <= 3 || state.mirrorDecodedCount >= state.lastPrintedMirrorDecodedCount + 50))
+        || (state.mirrorPlayedCount != state.lastPrintedMirrorPlayedCount
+            && (state.mirrorPlayedCount <= 3 || state.mirrorPlayedCount >= state.lastPrintedMirrorPlayedCount + 100))
+        || state.mirrorMissedCount != state.lastPrintedMirrorMissedCount
+        || (state.mirrorStoppedCount != state.lastPrintedMirrorStoppedCount
+            && (state.mirrorStoppedCount <= 3 || state.mirrorStoppedCount >= state.lastPrintedMirrorStoppedCount + 50))
+        || (state.musicDecodedCount != state.lastPrintedMusicDecodedCount
+            && (state.musicDecodedCount <= 3 || state.musicDecodedCount >= state.lastPrintedMusicDecodedCount + 25))
+        || (state.musicPlayedCount != state.lastPrintedMusicPlayedCount
+            && (state.musicPlayedCount <= 3 || state.musicPlayedCount >= state.lastPrintedMusicPlayedCount + 100))
+        || state.musicMissedCount != state.lastPrintedMusicMissedCount;
+    if (!shouldPrint)
         return;
 
     std::wstringstream line;
@@ -2716,6 +3266,68 @@ void PrintMirrorStats(const ProbeState& state, ProbeLog& log)
          << L" musicDecoded=" << state.musicDecodedCount
          << L" musicPlayed=" << state.musicPlayedCount
          << L" musicMissed=" << state.musicMissedCount;
+    if (state.playbackEventAgeCount != 0) {
+        line << L" eventAgeAvgUs=" << std::fixed << std::setprecision(1)
+             << (state.playbackEventAgeTotalUs / static_cast<double>(state.playbackEventAgeCount))
+             << L" eventAgeMaxUs=" << state.playbackEventAgeMaxUs
+             << std::defaultfloat;
+    }
+    PrintAndLogLine(line.str(), log);
+
+    state.lastPrintedMirrorDecodedCount = state.mirrorDecodedCount;
+    state.lastPrintedMirrorPlayedCount = state.mirrorPlayedCount;
+    state.lastPrintedMirrorMissedCount = state.mirrorMissedCount;
+    state.lastPrintedMirrorStoppedCount = state.mirrorStoppedCount;
+    state.lastPrintedMusicDecodedCount = state.musicDecodedCount;
+    state.lastPrintedMusicPlayedCount = state.musicPlayedCount;
+    state.lastPrintedMusicMissedCount = state.musicMissedCount;
+}
+
+double MeasureEventAgeUs(const olab::SharedChannel& channel, const olab::EventRecord& record)
+{
+    if (record.qpc == 0 || channel.qpcFrequency.QuadPart == 0)
+        return -1.0;
+
+    LARGE_INTEGER now {};
+    QueryPerformanceCounter(&now);
+    const double elapsedTicks = static_cast<double>(now.QuadPart) - static_cast<double>(record.qpc);
+    if (elapsedTicks < 0.0)
+        return 0.0;
+
+    return elapsedTicks * 1000000.0 / static_cast<double>(channel.qpcFrequency.QuadPart);
+}
+
+void ObservePlaybackEventAge(ProbeState& state, double eventAgeUs)
+{
+    if (eventAgeUs < 0.0)
+        return;
+
+    state.playbackEventAgeCount++;
+    state.playbackEventAgeTotalUs += eventAgeUs;
+    state.playbackEventAgeMaxUs = std::max(state.playbackEventAgeMaxUs, eventAgeUs);
+}
+
+void PrintEventAgeSpike(
+    const wchar_t* source,
+    const olab::EventRecord& record,
+    std::uint64_t sample,
+    std::uint64_t playbackChannel,
+    double eventAgeUs,
+    ProbeLog& log)
+{
+    if (eventAgeUs < 500.0)
+        return;
+
+    std::wstringstream line;
+    line << L"MirrorEventAgeSpike source=\"" << source << L"\""
+         << L" sequence=" << record.sequence
+         << L" eventAgeUs=" << std::fixed << std::setprecision(1) << eventAgeUs << std::defaultfloat
+         << L" sample=0x" << std::hex << sample
+         << L" channel=0x" << playbackChannel
+         << L" eventHandle=0x" << record.value0
+         << L" eventValue1=0x" << record.value1
+         << std::dec
+         << L" kind=\"" << olab::ToString(record.kind) << L"\"";
     PrintAndLogLine(line.str(), log);
 }
 
@@ -2735,13 +3347,13 @@ std::uint64_t ResolveAlias(const ProbeState& state, std::uint64_t channel)
 
 bool UsesLivePcmMusic(OutputBackend backend)
 {
-    return backend == OutputBackend::Asio
-        || backend == OutputBackend::WasapiExclusive;
+    return backend == OutputBackend::Asio;
 }
 
 bool UsesDecodedMusicStreams(OutputBackend backend)
 {
-    return backend == OutputBackend::XAudio2;
+    return backend == OutputBackend::XAudio2
+        || backend == OutputBackend::WasapiExclusive;
 }
 
 bool IsLiveMusicHandle(const ProbeState& state, std::uint64_t handle, std::uint64_t resolved)
@@ -3097,8 +3709,34 @@ bool IsHighFrequencyEvent(olab::EventKind kind)
 {
     return kind == olab::EventKind::ChannelSetAttribute
         || kind == olab::EventKind::ChannelSetPosition
+        || kind == olab::EventKind::ChannelPlay
+        || kind == olab::EventKind::SampleGetChannel
+        || kind == olab::EventKind::MixerStreamAddChannel
+        || kind == olab::EventKind::MixerStreamRemoveChannel
         || kind == olab::EventKind::ChannelGetData
         || kind == olab::EventKind::ChannelGetInfo;
+}
+
+bool IsStatusEvent(olab::EventKind kind)
+{
+    return kind == olab::EventKind::HostStarted
+        || kind == olab::EventKind::HookLoaded
+        || kind == olab::EventKind::HookUnloaded
+        || kind == olab::EventKind::BassModuleWaiting
+        || kind == olab::EventKind::BassModuleFound
+        || kind == olab::EventKind::HookInstalled
+        || kind == olab::EventKind::HookInstallFailed
+        || kind == olab::EventKind::BassStop
+        || kind == olab::EventKind::BassFree;
+}
+
+bool ShouldPrintEvent(olab::EventKind kind, bool verbose, const ProbeLog& log)
+{
+    if (verbose)
+        return true;
+    if (!log.IsEnabled())
+        return IsStatusEvent(kind);
+    return !IsHighFrequencyEvent(kind);
 }
 
 std::wstring FormatEvent(const olab::SharedChannel& channel, const olab::EventRecord& record)
@@ -3389,8 +4027,11 @@ void UpdateProbeStateAndPrintDerived(
                 && !state.channelMixers.contains(record.value0)
                 && !state.musicStreams.contains(stream)) {
                 const float volume = ResolveEffectsVolume(state.config);
+                const double eventAgeUs = MeasureEventAgeUs(channel, record);
+                ObservePlaybackEventAge(state, eventAgeUs);
+                PrintEventAgeSpike(L"ChannelPlay", record, sampleIt->second, source, eventAgeUs, log);
                 StopRelatedChannels(*state.audioMirror, state, source, L"ChannelPlay", log);
-                if (state.audioMirror->PlaySample(sampleIt->second, source, volume, log))
+                if (state.audioMirror->PlaySample(sampleIt->second, source, volume, eventAgeUs, log))
                     state.mirrorPlayedCount++;
                 else
                     state.mirrorMissedCount++;
@@ -3487,7 +4128,10 @@ void UpdateProbeStateAndPrintDerived(
         state.inferredSamplePlaybackCount++;
         if (state.audioMirror != nullptr) {
             const float volume = ResolveEffectsVolume(state.config);
-            if (state.audioMirror->PlaySample(sample, source, volume, log))
+            const double eventAgeUs = MeasureEventAgeUs(channel, record);
+            ObservePlaybackEventAge(state, eventAgeUs);
+            PrintEventAgeSpike(L"MixerStreamAddChannel", record, sample, source, eventAgeUs, log);
+            if (state.audioMirror->PlaySample(sample, source, volume, eventAgeUs, log))
                 state.mirrorPlayedCount++;
             else
                 state.mirrorMissedCount++;
@@ -3514,32 +4158,68 @@ void UpdateProbeStateAndPrintDerived(
     }
 }
 
-void Listen(const SharedHandles& handles, bool verbose, ProbeLog& log, ProbeState state)
+void Listen(const SharedHandles& handles, HANDLE consoleStopEvent, HANDLE shutdownEvent, bool verbose, ProbeLog& log, ProbeState state)
 {
+    DWORD taskIndex = 0;
+    HANDLE mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+    if (mmcssHandle != nullptr)
+        AvSetMmThreadPriority(mmcssHandle, AVRT_PRIORITY_HIGH);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
     LONG64 nextSequence = 1;
     std::wcout << L"Listening for BASS probe events. Press Ctrl+C to stop.\n";
     if (log.IsEnabled())
         std::wcout << L"Writing probe log: " << log.Path() << L"\n";
 
-    while (true) {
-        WaitForSingleObject(handles.event, 1000);
+    std::vector<HANDLE> waitHandles;
+    waitHandles.push_back(handles.event);
+    if (consoleStopEvent != nullptr)
+        waitHandles.push_back(consoleStopEvent);
+    if (shutdownEvent != nullptr)
+        waitHandles.push_back(shutdownEvent);
+
+    while (!g_stopRequested.load()) {
+        const DWORD waitResult = WaitForMultipleObjects(
+            static_cast<DWORD>(waitHandles.size()),
+            waitHandles.data(),
+            FALSE,
+            1000);
+        if (waitResult == WAIT_FAILED) {
+            std::wstringstream line;
+            line << L"WaitForMultipleObjects failed. GetLastError=" << GetLastError();
+            PrintAndLogLine(line.str(), log);
+            break;
+        }
+        if (waitResult >= WAIT_OBJECT_0 + 1 && waitResult < WAIT_OBJECT_0 + waitHandles.size())
+            break;
+
         const LONG64 writeSequence = handles.channel->writeSequence;
         while (nextSequence <= writeSequence) {
             const olab::EventRecord& record = handles.channel->events[static_cast<std::size_t>(nextSequence % olab::EventCapacity)];
             if (record.sequence == nextSequence) {
                 UpdateProbeStateAndPrintDerived(*handles.channel, record, state, log);
-                if (verbose || !IsHighFrequencyEvent(record.kind))
+                if (ShouldPrintEvent(record.kind, verbose, log))
                     PrintAndLogEvent(*handles.channel, record, log);
             }
             nextSequence++;
         }
     }
+
+    PrintAndLogLine(L"Shutdown requested. Releasing audio output.", log);
+    if (mmcssHandle != nullptr)
+        AvRevertMmThreadCharacteristics(mmcssHandle);
 }
 
 } // namespace
 
 int wmain(int argc, wchar_t* argv[])
 {
+    UniqueHandle consoleStopEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (consoleStopEvent) {
+        g_consoleStopEvent = consoleStopEvent.Get();
+        SetConsoleCtrlHandler(ConsoleControlHandler, TRUE);
+    }
+
     std::optional<DWORD> pid;
     std::wstring processName = L"osu!.exe";
     bool inject = true;
@@ -3555,6 +4235,7 @@ int wmain(int argc, wchar_t* argv[])
     std::optional<std::filesystem::path> explicitLogPath;
     ProbeState probeState;
     std::optional<std::filesystem::path> decodeDirectory;
+    std::optional<std::wstring> shutdownEventName;
 
     for (int i = 1; i < argc; i++) {
         const std::wstring arg = argv[i];
@@ -3661,6 +4342,10 @@ int wmain(int argc, wchar_t* argv[])
             decodeDirectory = argv[++i];
             continue;
         }
+        if (arg == L"--shutdown-event" && i + 1 < argc) {
+            shutdownEventName = argv[++i];
+            continue;
+        }
         if (arg == L"--test-tone") {
             testTone = true;
             inject = false;
@@ -3669,6 +4354,15 @@ int wmain(int argc, wchar_t* argv[])
 
         PrintUsage();
         return 1;
+    }
+
+    UniqueHandle shutdownEvent;
+    if (shutdownEventName) {
+        shutdownEvent.Reset(OpenEventW(SYNCHRONIZE, FALSE, shutdownEventName->c_str()));
+        if (!shutdownEvent) {
+            std::wcerr << L"Could not open shutdown event: " << *shutdownEventName << L" GetLastError=" << GetLastError() << L"\n";
+            return 1;
+        }
     }
 
     if (decodeDirectory)
@@ -3696,7 +4390,16 @@ int wmain(int argc, wchar_t* argv[])
                 return 1;
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            HANDLE waitHandles[2] {};
+            DWORD waitCount = 0;
+            if (consoleStopEvent)
+                waitHandles[waitCount++] = consoleStopEvent.Get();
+            if (shutdownEvent)
+                waitHandles[waitCount++] = shutdownEvent.Get();
+            if (waitCount == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            else
+                WaitForMultipleObjects(waitCount, waitHandles, FALSE, 1000);
             return 0;
         }
 
@@ -3750,7 +4453,7 @@ int wmain(int argc, wchar_t* argv[])
             std::wcout << L"Injection completed.\n";
         }
 
-        Listen(handles, verbose, log, std::move(probeState));
+        Listen(handles, consoleStopEvent.Get(), shutdownEvent.Get(), verbose, log, std::move(probeState));
     } catch (const std::exception& ex) {
         std::cerr << ex.what() << "\n";
         return 1;

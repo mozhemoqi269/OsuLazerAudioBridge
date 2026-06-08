@@ -29,7 +29,7 @@ anti-detection behavior.
 Use the release zip:
 
 ```text
-OsuLazerAudioBridge-v0.1.0-alpha.1-windows-x64.zip
+OsuLazerAudioBridge-v0.2.0-alpha.1-windows-x64.zip
 ```
 
 Extract it to a normal folder, for example:
@@ -60,7 +60,8 @@ Keep the three executable files in the same directory.
 4. In **Audio Output**, choose `ASIO`.
 5. Select your ASIO driver, for example `TOPPING Pro USB Audio Device`.
 6. Set sample rate to `48000`.
-7. Set buffer to the value your driver can run stably.
+7. Leave ASIO buffer as `Driver`; configure the actual buffer in your ASIO
+   driver control panel.
 8. Enable **Mirror audio**.
 9. Enable **Mirror music** only if you want the bridge to also take over music.
 10. Click Start.
@@ -69,7 +70,7 @@ Recommended first test:
 
 - Backend: `ASIO`
 - Sample rate: `48000`
-- Buffer: driver default or `3-10 ms`
+- Buffer: `Driver`
 - Effects volume: `100`
 - Music volume: `75`
 - Mirror audio: enabled
@@ -106,13 +107,13 @@ The GUI is recommended, but the host can be run directly.
 ASIO effects only:
 
 ```powershell
-.\OsuLazerAudioHost.exe --process "osu!.exe" --mirror-audio --output-backend asio --output-sample-rate 48000 --output-buffer-ms 3 --effects-volume 100 --music-volume 75 --output-device "TOPPING Pro USB Audio Device" --no-log
+.\OsuLazerAudioHost.exe --process "osu!.exe" --mirror-audio --output-backend asio --output-sample-rate 48000 --output-buffer-ms 0 --effects-volume 100 --music-volume 75 --output-device "TOPPING Pro USB Audio Device" --no-log
 ```
 
 ASIO effects + music:
 
 ```powershell
-.\OsuLazerAudioHost.exe --process "osu!.exe" --mirror-audio --mirror-music --output-backend asio --output-sample-rate 48000 --output-buffer-ms 3 --effects-volume 100 --music-volume 75 --output-device "TOPPING Pro USB Audio Device" --no-log
+.\OsuLazerAudioHost.exe --process "osu!.exe" --mirror-audio --mirror-music --output-backend asio --output-sample-rate 48000 --output-buffer-ms 0 --effects-volume 100 --music-volume 75 --output-device "TOPPING Pro USB Audio Device" --no-log
 ```
 
 List ASIO drivers:

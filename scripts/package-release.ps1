@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "v0.1.0-alpha.1",
+    [string]$Version = "v0.2.0-alpha.1",
     [string]$Configuration = "Release"
 )
 
@@ -67,22 +67,23 @@ Keep the three executable files in the same folder.
 5. Select ASIO.
 6. Select your ASIO driver.
 7. Set sample rate to 48000.
-8. Start with Mirror audio enabled and Mirror music disabled.
-9. Click Start.
-10. If effects are stable, enable Mirror music and test again.
+8. Leave ASIO buffer as Driver and configure the real buffer in the ASIO driver control panel.
+9. Start with Mirror audio enabled and Mirror music disabled.
+10. Click Start.
+11. If effects are stable, enable Mirror music and test again.
 
 ## Command Line Examples
 
 Effects only:
 
 ```powershell
-.\OsuLazerAudioHost.exe --process "osu!.exe" --mirror-audio --output-backend asio --output-sample-rate 48000 --output-buffer-ms 3 --effects-volume 100 --music-volume 75 --output-device "TOPPING Pro USB Audio Device" --no-log
+.\OsuLazerAudioHost.exe --process "osu!.exe" --mirror-audio --output-backend asio --output-sample-rate 48000 --output-buffer-ms 0 --effects-volume 100 --music-volume 75 --output-device "TOPPING Pro USB Audio Device" --no-log
 ```
 
 Effects + music:
 
 ```powershell
-.\OsuLazerAudioHost.exe --process "osu!.exe" --mirror-audio --mirror-music --output-backend asio --output-sample-rate 48000 --output-buffer-ms 3 --effects-volume 100 --music-volume 75 --output-device "TOPPING Pro USB Audio Device" --no-log
+.\OsuLazerAudioHost.exe --process "osu!.exe" --mirror-audio --mirror-music --output-backend asio --output-sample-rate 48000 --output-buffer-ms 0 --effects-volume 100 --music-volume 75 --output-device "TOPPING Pro USB Audio Device" --no-log
 ```
 
 List ASIO drivers:
