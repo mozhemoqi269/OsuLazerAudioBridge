@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(OsuLazerAudioBridge
-    VERSION 0.1.0
+    VERSION 0.2.0
     LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -53,6 +53,14 @@ target_compile_definitions(OsuLazerBassHook PRIVATE
 
 add_executable(OsuLazerAudioHost
     native/host/AudioHost.cpp
+    native/host/HostAudioOutput.cpp
+    native/host/HostAsioDevices.cpp
+    native/host/HostLogging.cpp
+    native/host/HostNativeAsioOutput.cpp
+    native/host/HostSharedChannel.cpp
+    native/host/HostWasapiOutput.cpp
+    native/host/HostWin32.cpp
+    native/host/HostXAudio2Output.cpp
     native/host/SampleDecoder.cpp)
 target_link_libraries(OsuLazerAudioHost PRIVATE
     OsuLazerAudioShared
@@ -70,6 +78,7 @@ target_compile_definitions(OsuLazerAudioHost PRIVATE
 add_executable(OsuLazerAudioBridge WIN32
     native/gui/AudioBridgeGui.cpp)
 target_link_libraries(OsuLazerAudioBridge PRIVATE
+    OsuLazerAudioShared
     ole32
     uuid
     shell32

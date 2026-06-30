@@ -51,6 +51,7 @@ enum class EventKind : std::uint32_t {
     MusicFree,
     BassStop,
     BassFree,
+    RuntimeConfig,
 };
 
 struct EventRecord {
@@ -72,6 +73,7 @@ struct EventRecord {
 struct SharedChannel {
     std::uint32_t magic;
     std::uint32_t version;
+    volatile LONG64 generation;
     volatile LONG64 writeSequence;
     volatile LONG droppedEvents;
     volatile LONG64 blobWriteOffset;
@@ -84,6 +86,9 @@ inline void InitializeSharedChannel(SharedChannel& channel)
 {
     channel.magic = ProtocolMagic;
     channel.version = ProtocolVersion;
+    LARGE_INTEGER now {};
+    QueryPerformanceCounter(&now);
+    channel.generation = now.QuadPart;
     channel.writeSequence = 0;
     channel.droppedEvents = 0;
     channel.blobWriteOffset = 0;
@@ -195,6 +200,8 @@ inline const wchar_t* ToString(EventKind kind)
         return L"BassStop";
     case EventKind::BassFree:
         return L"BassFree";
+    case EventKind::RuntimeConfig:
+        return L"RuntimeConfig";
     default:
         return L"Unknown";
     }

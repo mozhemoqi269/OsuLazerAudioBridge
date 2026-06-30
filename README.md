@@ -29,7 +29,7 @@ anti-detection behavior.
 Use the release zip:
 
 ```text
-OsuLazerAudioBridge-v0.2.0-alpha.1-windows-x64.zip
+OsuLazerAudioBridge-v0.2.0-windows-x64.zip
 ```
 
 Extract it to a normal folder, for example:

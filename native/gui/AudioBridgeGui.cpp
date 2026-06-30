@@ -20,6 +20,8 @@
 #include <thread>
 #include <vector>
 
+#include <olab/SharedChannel.h>
+
 namespace {
 
 using Microsoft::WRL::ComPtr;
@@ -75,6 +77,8 @@ enum ControlId {
     SectionThreeStaticId = 1044,
     EffectsVolumeValueStaticId = 1045,
     MusicVolumeValueStaticId = 1046,
+    MixClaritySliderId = 1047,
+    MixClarityValueStaticId = 1048,
 };
 
 enum class UiPage {
@@ -87,6 +91,9 @@ struct ChildProcess {
     PROCESS_INFORMATION process {};
     HANDLE stdoutRead = nullptr;
     HANDLE stdoutWrite = nullptr;
+    HANDLE controlMapping = nullptr;
+    HANDLE controlEvent = nullptr;
+    olab::SharedChannel* controlChannel = nullptr;
     HANDLE shutdownEvent = nullptr;
     std::wstring shutdownEventName;
     std::thread readerThread;
@@ -140,8 +147,10 @@ HWND g_outputBufferCombo = nullptr;
 HWND g_outputChannelsCombo = nullptr;
 HWND g_effectsVolumeSlider = nullptr;
 HWND g_musicVolumeSlider = nullptr;
+HWND g_mixClaritySlider = nullptr;
 HWND g_effectsVolumeValueStatic = nullptr;
 HWND g_musicVolumeValueStatic = nullptr;
+HWND g_mixClarityValueStatic = nullptr;
 HWND g_refreshDevicesButton = nullptr;
 HWND g_asioPanelButton = nullptr;
 HWND g_openSettingsButton = nullptr;
@@ -486,6 +495,19 @@ int ParseVolumePercent(const std::wstring& text, int fallback)
     return std::clamp(static_cast<int>(parsed), 0, 200);
 }
 
+int ParsePercent100(const std::wstring& text, int fallback)
+{
+    if (text.empty())
+        return fallback;
+
+    wchar_t* end = nullptr;
+    const long parsed = std::wcstol(text.c_str(), &end, 10);
+    if (end == text.c_str())
+        return fallback;
+
+    return std::clamp(static_cast<int>(parsed), 0, 100);
+}
+
 std::wstring SliderValueText(HWND slider)
 {
     if (slider == nullptr)
@@ -502,6 +524,14 @@ void SetVolumeSlider(HWND slider, const std::wstring& value)
     SendMessageW(slider, TBM_SETPOS, TRUE, ParseVolumePercent(value, 100));
 }
 
+void SetPercentSlider(HWND slider, const std::wstring& value, int fallback)
+{
+    if (slider == nullptr)
+        return;
+
+    SendMessageW(slider, TBM_SETPOS, TRUE, ParsePercent100(value, fallback));
+}
+
 void UpdateVolumeSliderLabels()
 {
     if (g_effectsVolumeValueStatic != nullptr) {
@@ -512,6 +542,11 @@ void UpdateVolumeSliderLabels()
     if (g_musicVolumeValueStatic != nullptr) {
         const std::wstring text = SliderValueText(g_musicVolumeSlider) + L"%";
         SetWindowTextW(g_musicVolumeValueStatic, text.c_str());
+    }
+
+    if (g_mixClarityValueStatic != nullptr) {
+        const std::wstring text = SliderValueText(g_mixClaritySlider) + L"%";
+        SetWindowTextW(g_mixClarityValueStatic, text.c_str());
     }
 }
 
@@ -823,6 +858,9 @@ void SelectPage(UiPage page)
     SetVisible(GetDlgItem(g_window, MusicVolumeComboId + 10000), audio);
     SetVisible(g_musicVolumeSlider, audio);
     SetVisible(g_musicVolumeValueStatic, audio);
+    SetVisible(GetDlgItem(g_window, MixClaritySliderId + 10000), audio);
+    SetVisible(g_mixClaritySlider, audio);
+    SetVisible(g_mixClarityValueStatic, audio);
     SetVisible(g_testToneButton, audio);
     SetVisible(g_refreshDevicesButton, audio);
     SetVisible(g_asioPanelButton, audio);
@@ -898,6 +936,7 @@ void LoadSettings(
     std::wstring& outputChannels,
     std::wstring& effectsVolume,
     std::wstring& musicVolume,
+    std::wstring& mixOverlapDucking,
     bool& verboseEvents,
     bool& logEnabled,
     bool& dumpSamples,
@@ -930,6 +969,8 @@ void LoadSettings(
     effectsVolume = buffer;
     GetPrivateProfileStringW(L"ui", L"musicVolume", L"100", buffer, static_cast<DWORD>(std::size(buffer)), path.c_str());
     musicVolume = buffer;
+    GetPrivateProfileStringW(L"ui", L"mixOverlapDucking", L"25", buffer, static_cast<DWORD>(std::size(buffer)), path.c_str());
+    mixOverlapDucking = buffer;
     verboseEvents = GetPrivateProfileIntW(L"ui", L"verboseEvents", 0, path.c_str()) != 0;
     logEnabled = GetPrivateProfileIntW(L"ui", L"logEnabled", 0, path.c_str()) != 0;
     dumpSamples = GetPrivateProfileIntW(L"ui", L"dumpSamples", 0, path.c_str()) != 0;
@@ -958,6 +999,7 @@ void SaveSettings()
     const std::wstring outputChannels = CurrentComboText(g_outputChannelsCombo);
     const std::wstring effectsVolume = SliderValueText(g_effectsVolumeSlider);
     const std::wstring musicVolume = SliderValueText(g_musicVolumeSlider);
+    const std::wstring mixOverlapDucking = SliderValueText(g_mixClaritySlider);
     const bool logEnabled = SendMessageW(g_logEnabledCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
     const bool dumpSamples = SendMessageW(g_dumpSamplesCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
     const std::wstring dumpDirectory = GetWindowTextString(g_dumpDirEdit);
@@ -974,6 +1016,7 @@ void SaveSettings()
     WritePrivateProfileStringW(L"ui", L"outputChannels", outputChannels.c_str(), path.c_str());
     WritePrivateProfileStringW(L"ui", L"effectsVolume", effectsVolume.c_str(), path.c_str());
     WritePrivateProfileStringW(L"ui", L"musicVolume", musicVolume.c_str(), path.c_str());
+    WritePrivateProfileStringW(L"ui", L"mixOverlapDucking", mixOverlapDucking.c_str(), path.c_str());
     WritePrivateProfileStringW(L"ui", L"verboseEvents", verboseEvents ? L"1" : L"0", path.c_str());
     WritePrivateProfileStringW(L"ui", L"logEnabled", logEnabled ? L"1" : L"0", path.c_str());
     WritePrivateProfileStringW(L"ui", L"dumpSamples", dumpSamples ? L"1" : L"0", path.c_str());
@@ -990,6 +1033,63 @@ void CloseHandleIfSet(HANDLE& handle)
     }
 }
 
+void CloseRuntimeControlChannel()
+{
+    if (g_child.controlChannel != nullptr) {
+        UnmapViewOfFile(g_child.controlChannel);
+        g_child.controlChannel = nullptr;
+    }
+    CloseHandleIfSet(g_child.controlEvent);
+    CloseHandleIfSet(g_child.controlMapping);
+}
+
+bool EnsureRuntimeControlChannel()
+{
+    if (g_child.controlChannel != nullptr && g_child.controlEvent != nullptr)
+        return true;
+
+    CloseRuntimeControlChannel();
+    g_child.controlMapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, olab::SharedMemoryName);
+    if (g_child.controlMapping == nullptr)
+        return false;
+
+    g_child.controlChannel = static_cast<olab::SharedChannel*>(
+        MapViewOfFile(g_child.controlMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(olab::SharedChannel)));
+    if (g_child.controlChannel == nullptr) {
+        CloseRuntimeControlChannel();
+        return false;
+    }
+
+    g_child.controlEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, olab::EventName);
+    if (g_child.controlEvent == nullptr) {
+        CloseRuntimeControlChannel();
+        return false;
+    }
+
+    return true;
+}
+
+void PublishRuntimeConfig()
+{
+    if (!g_child.IsActive() || !EnsureRuntimeControlChannel())
+        return;
+
+    const float effectsVolume = static_cast<float>(SendMessageW(g_effectsVolumeSlider, TBM_GETPOS, 0, 0)) / 100.0f;
+    const float musicVolume = static_cast<float>(SendMessageW(g_musicVolumeSlider, TBM_GETPOS, 0, 0)) / 100.0f;
+    const auto mixClarity = static_cast<std::uint64_t>(SendMessageW(g_mixClaritySlider, TBM_GETPOS, 0, 0));
+    olab::PublishEvent(
+        g_child.controlChannel,
+        g_child.controlEvent,
+        olab::EventKind::RuntimeConfig,
+        mixClarity,
+        0,
+        0,
+        0,
+        effectsVolume,
+        musicVolume,
+        L"gui runtime config");
+}
+
 std::wstring MakeShutdownEventName()
 {
     std::wstringstream stream;
@@ -1004,6 +1104,7 @@ void CleanupChild()
 
     CloseHandleIfSet(g_child.stdoutRead);
     CloseHandleIfSet(g_child.stdoutWrite);
+    CloseRuntimeControlChannel();
     CloseHandleIfSet(g_child.shutdownEvent);
     CloseHandleIfSet(g_child.process.hThread);
     CloseHandleIfSet(g_child.process.hProcess);
@@ -1233,6 +1334,7 @@ std::wstring BuildOutputArguments()
     arguments += L" --output-buffer-ms " + QuoteArgument(CurrentOutputBufferArgument());
     arguments += L" --effects-volume " + QuoteArgument(SliderValueText(g_effectsVolumeSlider));
     arguments += L" --music-volume " + QuoteArgument(SliderValueText(g_musicVolumeSlider));
+    arguments += L" --mix-overlap-ducking " + QuoteArgument(SliderValueText(g_mixClaritySlider));
     return arguments;
 }
 
@@ -1598,10 +1700,13 @@ void LayoutControls(int width, int height)
     MoveWindow(GetDlgItem(g_window, MusicVolumeComboId + 10000), contentX, sectionThreeRow + (rowHeight + gap) * 2 + 4, labelWidth, rowHeight, TRUE);
     MoveWindow(g_musicVolumeSlider, contentX + labelWidth, sectionThreeRow + (rowHeight + gap) * 2 - 2, contentWidth - labelWidth - 64, rowHeight + 6, TRUE);
     MoveWindow(g_musicVolumeValueStatic, contentX + contentWidth - 56, sectionThreeRow + (rowHeight + gap) * 2 + 4, 56, rowHeight, TRUE);
-    MoveWindow(g_musicModeHintStatic, contentX, sectionThreeRow + (rowHeight + gap) * 3, contentWidth, 64, TRUE);
-    MoveWindow(g_testToneButton, contentX, sectionThreeRow + (rowHeight + gap) * 3 + 72, buttonWidth, buttonHeight, TRUE);
-    MoveWindow(g_refreshDevicesButton, contentX + buttonWidth + gap, sectionThreeRow + (rowHeight + gap) * 3 + 72, buttonWidth + 18, buttonHeight, TRUE);
-    MoveWindow(g_asioPanelButton, contentX + (buttonWidth + gap) * 2 + 18, sectionThreeRow + (rowHeight + gap) * 3 + 72, buttonWidth + 6, buttonHeight, TRUE);
+    MoveWindow(GetDlgItem(g_window, MixClaritySliderId + 10000), contentX, sectionThreeRow + (rowHeight + gap) * 3 + 4, labelWidth, rowHeight, TRUE);
+    MoveWindow(g_mixClaritySlider, contentX + labelWidth, sectionThreeRow + (rowHeight + gap) * 3 - 2, contentWidth - labelWidth - 64, rowHeight + 6, TRUE);
+    MoveWindow(g_mixClarityValueStatic, contentX + contentWidth - 56, sectionThreeRow + (rowHeight + gap) * 3 + 4, 56, rowHeight, TRUE);
+    MoveWindow(g_musicModeHintStatic, contentX, sectionThreeRow + (rowHeight + gap) * 4, contentWidth, 64, TRUE);
+    MoveWindow(g_testToneButton, contentX, sectionThreeRow + (rowHeight + gap) * 4 + 72, buttonWidth, buttonHeight, TRUE);
+    MoveWindow(g_refreshDevicesButton, contentX + buttonWidth + gap, sectionThreeRow + (rowHeight + gap) * 4 + 72, buttonWidth + 18, buttonHeight, TRUE);
+    MoveWindow(g_asioPanelButton, contentX + (buttonWidth + gap) * 2 + 18, sectionThreeRow + (rowHeight + gap) * 4 + 72, buttonWidth + 6, buttonHeight, TRUE);
     MoveWindow(g_openSettingsButton, contentX, sectionThreeRow, buttonWidth, buttonHeight, TRUE);
     MoveWindow(g_openLogsButton, contentX + buttonWidth + gap, sectionThreeRow, buttonWidth, buttonHeight, TRUE);
     MoveWindow(g_clearButton, contentX + (buttonWidth + gap) * 2, sectionThreeRow, buttonWidth, buttonHeight, TRUE);
@@ -1640,6 +1745,7 @@ void CreateUi(HWND window)
     std::wstring outputChannels;
     std::wstring effectsVolume;
     std::wstring musicVolume;
+    std::wstring mixOverlapDucking;
     std::wstring dumpDirectory;
     bool mirrorAudio = true;
     bool mirrorMusic = false;
@@ -1647,7 +1753,7 @@ void CreateUi(HWND window)
     bool logEnabled = false;
     bool dumpSamples = false;
     bool injectHook = true;
-    LoadSettings(processName, logDirectory, mirrorAudio, mirrorMusic, outputBackend, outputDeviceId, outputSampleRate, outputBufferMs, outputChannels, effectsVolume, musicVolume, verboseEvents, logEnabled, dumpSamples, dumpDirectory, injectHook, g_currentPage);
+    LoadSettings(processName, logDirectory, mirrorAudio, mirrorMusic, outputBackend, outputDeviceId, outputSampleRate, outputBufferMs, outputChannels, effectsVolume, musicVolume, mixOverlapDucking, verboseEvents, logEnabled, dumpSamples, dumpDirectory, injectHook, g_currentPage);
 
     g_audioPageButton = CreateControl(L"BUTTON", L"Audio output", BS_AUTORADIOBUTTON | BS_PUSHLIKE | BS_OWNERDRAW, AudioPageButtonId);
     g_hookPageButton = CreateControl(L"BUTTON", L"Game hook", BS_AUTORADIOBUTTON | BS_PUSHLIKE | BS_OWNERDRAW, HookPageButtonId);
@@ -1724,6 +1830,14 @@ void CreateUi(HWND window)
     SendMessageW(g_musicVolumeSlider, TBM_SETPAGESIZE, 0, 5);
     SetVolumeSlider(g_musicVolumeSlider, musicVolume);
     g_musicVolumeValueStatic = CreateControl(L"STATIC", L"", SS_RIGHT, MusicVolumeValueStaticId);
+    CreateControl(L"STATIC", L"Mix clarity", 0, MixClaritySliderId + 10000);
+    g_mixClaritySlider = CreateControl(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | TBS_TOOLTIPS, MixClaritySliderId);
+    SendMessageW(g_mixClaritySlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+    SendMessageW(g_mixClaritySlider, TBM_SETTICFREQ, 25, 0);
+    SendMessageW(g_mixClaritySlider, TBM_SETLINESIZE, 0, 1);
+    SendMessageW(g_mixClaritySlider, TBM_SETPAGESIZE, 0, 5);
+    SetPercentSlider(g_mixClaritySlider, mixOverlapDucking, 25);
+    g_mixClarityValueStatic = CreateControl(L"STATIC", L"", SS_RIGHT, MixClarityValueStaticId);
     UpdateVolumeSliderLabels();
     g_musicModeHintStatic = CreateControl(
         L"STATIC",
@@ -2022,9 +2136,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
 
     case WM_HSCROLL:
-        if (reinterpret_cast<HWND>(lParam) == g_effectsVolumeSlider || reinterpret_cast<HWND>(lParam) == g_musicVolumeSlider) {
+        if (reinterpret_cast<HWND>(lParam) == g_effectsVolumeSlider
+            || reinterpret_cast<HWND>(lParam) == g_musicVolumeSlider
+            || reinterpret_cast<HWND>(lParam) == g_mixClaritySlider) {
             UpdateVolumeSliderLabels();
             SaveSettings();
+            PublishRuntimeConfig();
             return 0;
         }
         break;

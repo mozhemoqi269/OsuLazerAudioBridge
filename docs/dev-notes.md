@@ -5,18 +5,23 @@ GitHub README.
 
 ## Current Milestone
 
-Native BASS hook probe.
+ASIO-first bridge prototype.
 
-Goal:
+Current state:
 
 - Keep the official osu!lazer client unchanged.
 - Inject a native x64 hook DLL into the osu!lazer process.
-- Detect `bass.dll`.
-- Hook selected BASS exports.
-- Publish lightweight probe events to a shared-memory channel.
-- Print probe events from the external host process.
+- Hook selected BASS and BASSmix exports.
+- Publish audio and probe events through a shared-memory channel.
+- Decode captured sample payloads in the external host process.
+- Mirror audio to XAudio2, WASAPI Exclusive, or ASIO.
+- Expose the host through both CLI and the Win32 GUI launcher.
 
-No ASIO playback is implemented in this milestone.
+Effects mirroring is the primary supported path. Music mirroring exists, but is
+still more experimental and backend-sensitive.
+
+The earlier probe-only milestone is complete. The notes below are still useful
+for trace capture, decoding, and low-level debugging.
 
 ## Project Boundaries
 

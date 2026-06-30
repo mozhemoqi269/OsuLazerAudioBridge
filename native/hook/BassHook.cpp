@@ -53,6 +53,7 @@ constexpr DWORD BassDataFftFlag = 0x80000000;
 constexpr DWORD BassDataSizeMask = 0x0fffffff;
 constexpr DWORD MaxChannelDataBlobBytes = 1024 * 1024;
 constexpr DWORD MaxLazySampleBlobBytes = 8 * 1024 * 1024;
+constexpr ULONGLONG SharedChannelRetryMs = 50;
 
 struct BassChannelInfo {
     DWORD freq;
@@ -96,6 +97,8 @@ HMODULE thisModule = nullptr;
 HANDLE sharedMapping = nullptr;
 HANDLE sharedEvent = nullptr;
 olab::SharedChannel* channel = nullptr;
+LONG64 observedGeneration = 0;
+ULONGLONG nextSharedChannelAttemptTick = 0;
 
 BASS_SampleLoad_t originalSampleLoad = nullptr;
 BASS_SampleCreate_t originalSampleCreate = nullptr;
@@ -190,6 +193,95 @@ std::wstring ToWidePath(const void* file, DWORD flags)
     return result;
 }
 
+void ResetPublishedSamples()
+{
+    std::lock_guard<std::mutex> lock(publishedSamplesMutex);
+    publishedSamples.clear();
+}
+
+void UnmarkSamplePublished(HSAMPLE sample)
+{
+    if (sample == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(publishedSamplesMutex);
+    publishedSamples.erase(sample);
+}
+
+void CloseSharedChannel()
+{
+    if (channel != nullptr) {
+        UnmapViewOfFile(channel);
+        channel = nullptr;
+    }
+
+    if (sharedEvent != nullptr) {
+        CloseHandle(sharedEvent);
+        sharedEvent = nullptr;
+    }
+
+    if (sharedMapping != nullptr) {
+        CloseHandle(sharedMapping);
+        sharedMapping = nullptr;
+    }
+
+    observedGeneration = 0;
+}
+
+bool ObserveSharedGeneration()
+{
+    if (channel == nullptr
+        || channel->magic != olab::ProtocolMagic
+        || channel->version != olab::ProtocolVersion)
+        return false;
+
+    const LONG64 generation = channel->generation;
+    if (generation != 0 && generation != observedGeneration) {
+        observedGeneration = generation;
+        ResetPublishedSamples();
+    }
+
+    return true;
+}
+
+bool MapSharedChannel()
+{
+    CloseSharedChannel();
+
+    sharedMapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, olab::SharedMemoryName);
+    if (sharedMapping == nullptr)
+        return false;
+
+    channel = static_cast<olab::SharedChannel*>(
+        MapViewOfFile(sharedMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(olab::SharedChannel)));
+    if (channel == nullptr) {
+        CloseSharedChannel();
+        return false;
+    }
+
+    sharedEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, olab::EventName);
+    if (sharedEvent == nullptr) {
+        CloseSharedChannel();
+        return false;
+    }
+
+    nextSharedChannelAttemptTick = 0;
+    return ObserveSharedGeneration();
+}
+
+bool EnsureSharedChannel()
+{
+    if (sharedEvent != nullptr && ObserveSharedGeneration())
+        return true;
+
+    const ULONGLONG now = GetTickCount64();
+    if (now < nextSharedChannelAttemptTick)
+        return false;
+
+    nextSharedChannelAttemptTick = now + SharedChannelRetryMs;
+    return MapSharedChannel();
+}
+
 void Publish(
     olab::EventKind kind,
     std::uint64_t value0 = 0,
@@ -200,7 +292,22 @@ void Publish(
     float float1 = 0,
     const wchar_t* text = nullptr)
 {
+    if (!EnsureSharedChannel())
+        return;
+
     olab::PublishEvent(channel, sharedEvent, kind, value0, value1, value2, value3, float0, float1, text);
+}
+
+bool TryCopySharedBlob(
+    const void* source,
+    std::uint32_t length,
+    std::uint64_t& blobOffset,
+    std::uint64_t& blobLength)
+{
+    if (!EnsureSharedChannel())
+        return false;
+
+    return olab::TryCopySampleBlob(channel, source, length, blobOffset, blobLength);
 }
 
 bool TryCopyFileUserStream(
@@ -245,7 +352,7 @@ bool TryCopyFileUserStream(
 
     data.resize(copied);
     totalLength = length;
-    return olab::TryCopySampleBlob(channel, data.data(), static_cast<std::uint32_t>(data.size()), blobOffset, blobLength);
+    return TryCopySharedBlob(data.data(), static_cast<std::uint32_t>(data.size()), blobOffset, blobLength);
 }
 
 void MarkSamplePublished(HSAMPLE sample)
@@ -286,7 +393,9 @@ void TryPublishLazySampleData(HSAMPLE sample)
 
     std::uint64_t blobOffset = 0;
     std::uint64_t blobLength = 0;
-    olab::TryCopySampleBlob(channel, data.data(), info.length, blobOffset, blobLength);
+    if (!TryCopySharedBlob(data.data(), info.length, blobOffset, blobLength))
+        return;
+
     Publish(
         olab::EventKind::SampleGetData,
         sample,
@@ -297,21 +406,6 @@ void TryPublishLazySampleData(HSAMPLE sample)
         static_cast<float>(info.chans),
         L"lazy sample pcm");
     MarkSamplePublished(sample);
-}
-
-bool MapSharedChannel()
-{
-    sharedMapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, olab::SharedMemoryName);
-    if (sharedMapping == nullptr)
-        return false;
-
-    channel = static_cast<olab::SharedChannel*>(
-        MapViewOfFile(sharedMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(olab::SharedChannel)));
-    if (channel == nullptr)
-        return false;
-
-    sharedEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, olab::EventName);
-    return sharedEvent != nullptr;
 }
 
 void HookExport(HMODULE module, const wchar_t* moduleName, const char* name, void* detour, void** original)
@@ -430,7 +524,7 @@ HSAMPLE WINAPI BASS_SampleLoad(BOOL mem, const void* file, QWORD offset, DWORD l
     if (mem) {
         std::uint64_t blobOffset = 0;
         std::uint64_t blobLength = 0;
-        olab::TryCopySampleBlob(channel, file, length, blobOffset, blobLength);
+        const bool copiedSample = TryCopySharedBlob(file, length, blobOffset, blobLength);
         Publish(
             olab::EventKind::SampleLoadMemory,
             sample,
@@ -440,7 +534,8 @@ HSAMPLE WINAPI BASS_SampleLoad(BOOL mem, const void* file, QWORD offset, DWORD l
             0,
             0,
             L"memory sample");
-        MarkSamplePublished(sample);
+        if (copiedSample)
+            MarkSamplePublished(sample);
     } else {
         const std::wstring path = ToWidePath(file, flags);
         Publish(
@@ -478,6 +573,7 @@ HSAMPLE WINAPI BASS_SampleCreate(DWORD length, DWORD freq, DWORD channels, DWORD
 BOOL WINAPI BASS_SampleFree(HSAMPLE handle)
 {
     Publish(olab::EventKind::SampleFree, handle);
+    UnmarkSamplePublished(handle);
     return originalSampleFree(handle);
 }
 
@@ -500,7 +596,7 @@ HSTREAM WINAPI BASS_StreamCreateFile(BOOL mem, const void* file, QWORD offset, Q
         std::uint64_t blobOffset = 0;
         std::uint64_t blobLength = 0;
         if (offset <= length && length <= static_cast<QWORD>(olab::MaxSampleBlobBytes))
-            olab::TryCopySampleBlob(channel, static_cast<const std::uint8_t*>(file) + offset, static_cast<std::uint32_t>(length), blobOffset, blobLength);
+            TryCopySharedBlob(static_cast<const std::uint8_t*>(file) + offset, static_cast<std::uint32_t>(length), blobOffset, blobLength);
 
         Publish(
             olab::EventKind::StreamCreateFileMemory,
@@ -574,6 +670,7 @@ BOOL WINAPI BASS_Stop()
 BOOL WINAPI BASS_Free()
 {
     Publish(olab::EventKind::BassFree);
+    ResetPublishedSamples();
     return originalBassFree();
 }
 
@@ -646,7 +743,7 @@ DWORD WINAPI BASS_ChannelGetData(DWORD handle, void* buffer, DWORD length)
         std::uint64_t blobOffset = 0;
         std::uint64_t blobLength = 0;
         if (IsPcmChannelDataRequest(length) && buffer != nullptr && result != 0 && result <= MaxChannelDataBlobBytes)
-            olab::TryCopySampleBlob(channel, buffer, result, blobOffset, blobLength);
+            TryCopySharedBlob(buffer, result, blobOffset, blobLength);
 
         Publish(olab::EventKind::ChannelGetData, handle, length, blobLength, blobOffset);
     }
@@ -691,20 +788,7 @@ void Cleanup()
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();
 
-    if (channel != nullptr) {
-        UnmapViewOfFile(channel);
-        channel = nullptr;
-    }
-
-    if (sharedEvent != nullptr) {
-        CloseHandle(sharedEvent);
-        sharedEvent = nullptr;
-    }
-
-    if (sharedMapping != nullptr) {
-        CloseHandle(sharedMapping);
-        sharedMapping = nullptr;
-    }
+    CloseSharedChannel();
 }
 
 } // namespace
